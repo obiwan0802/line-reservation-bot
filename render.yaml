@@ -1,0 +1,29 @@
+# Render.com デプロイ設定
+services:
+  - type: web
+    name: line-reservation-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2
+    envVars:
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: OWNER_LINE_USER_ID
+        sync: false
+      - key: GOOGLE_CALENDAR_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: STORE_NAME
+        value: サンプルレストラン
+      - key: STORE_OPEN_HOUR
+        value: "11"
+      - key: STORE_CLOSE_HOUR
+        value: "22"
+      - key: MAX_SEATS
+        value: "30"
+      - key: SLOT_INTERVAL_MINUTES
+        value: "30"
