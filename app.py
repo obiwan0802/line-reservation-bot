@@ -1,5 +1,5 @@
 """
-飲食店向け LINE予約Bot
+飲食店向け LINE予約Bot（LINE Bot SDK v2 安定版）
 - メニュー（コース）選択 → 人数選択 → 日時選択 → 予約確定
 - Googleカレンダー連携で空き枠自動判定
 - オーナーへのLINE通知
@@ -13,24 +13,16 @@ import logging
 from zoneinfo import ZoneInfo
 
 from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler
-from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    PushMessageRequest,
-    TextMessage,
-    FlexMessage,
-    FlexContainer,
-)
-from linebot.v3.webhooks import (
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import (
     MessageEvent,
     PostbackEvent,
-    TextMessageContent,
     FollowEvent,
+    TextMessage,
+    TextSendMessage,
+    FlexSendMessage,
 )
-from linebot.v3.exceptions import InvalidSignatureError
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -63,7 +55,7 @@ SLOT_INTERVAL_MINUTES = int(os.environ.get("SLOT_INTERVAL_MINUTES", "30"))
 JST = ZoneInfo("Asia/Tokyo")
 
 # LINE SDK初期化
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -81,15 +73,14 @@ MENU_ITEMS = [
 # 予約セッション管理（インメモリ）
 # 本番運用ではRedisやDBに置き換え推奨
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-reservation_sessions = {}  # user_id -> {step, menu, guests, date, time, name, phone}
-confirmed_reservations = []  # 確定済み予約リスト
+reservation_sessions = {}
+confirmed_reservations = []
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Google Calendar連携
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def get_calendar_service():
-    """Googleカレンダーサービスを取得"""
     try:
         creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         creds = Credentials.from_service_account_info(
@@ -103,7 +94,6 @@ def get_calendar_service():
 
 
 def get_reserved_slots(date_str):
-    """指定日の予約済みスロットを取得"""
     service = get_calendar_service()
     if not service:
         return []
@@ -131,7 +121,6 @@ def get_reserved_slots(date_str):
 
 
 def count_reserved_seats(date_str, time_str):
-    """指定日時の予約済み席数を計算"""
     events = get_reserved_slots(date_str)
     target_time = datetime.datetime.strptime(
         f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
@@ -142,7 +131,6 @@ def count_reserved_seats(date_str, time_str):
         start = datetime.datetime.fromisoformat(event["start"].get("dateTime", ""))
         end = datetime.datetime.fromisoformat(event["end"].get("dateTime", ""))
         if start <= target_time < end:
-            # イベントの説明から人数を取得
             desc = event.get("description", "")
             try:
                 for line in desc.split("\n"):
@@ -150,12 +138,11 @@ def count_reserved_seats(date_str, time_str):
                         total_seats += int(line.split("人数:")[1].strip().replace("名", ""))
                         break
             except (ValueError, IndexError):
-                total_seats += 2  # デフォルト2名
+                total_seats += 2
     return total_seats
 
 
 def get_available_slots(date_str, guests, duration_minutes):
-    """空き時間スロットを取得"""
     now = datetime.datetime.now(JST)
     target_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=JST)
 
@@ -167,7 +154,6 @@ def get_available_slots(date_str, guests, duration_minutes):
         time_str = f"{hour:02d}:{minute:02d}"
         slot_time = target_date.replace(hour=hour, minute=minute)
 
-        # 過去の時間はスキップ
         if slot_time <= now:
             minute += SLOT_INTERVAL_MINUTES
             if minute >= 60:
@@ -175,20 +161,16 @@ def get_available_slots(date_str, guests, duration_minutes):
                 minute = 0
             continue
 
-        # 閉店時間を超えないかチェック
         end_time = slot_time + datetime.timedelta(minutes=duration_minutes)
         if end_time.hour > STORE_CLOSE_HOUR or (
             end_time.hour == STORE_CLOSE_HOUR and end_time.minute > 0
         ):
             break
 
-        # 空席チェック
         reserved = count_reserved_seats(date_str, time_str)
         available = MAX_SEATS - reserved
         if available >= guests:
-            slots.append(
-                {"time": time_str, "available": available}
-            )
+            slots.append({"time": time_str, "available": available})
 
         minute += SLOT_INTERVAL_MINUTES
         if minute >= 60:
@@ -199,7 +181,6 @@ def get_available_slots(date_str, guests, duration_minutes):
 
 
 def create_calendar_event(reservation):
-    """Googleカレンダーに予約イベントを追加"""
     service = get_calendar_service()
     if not service:
         return None
@@ -225,7 +206,7 @@ def create_calendar_event(reservation):
         ),
         "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Tokyo"},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Tokyo"},
-        "colorId": "9",  # ブルーベリー色
+        "colorId": "9",
     }
 
     try:
@@ -240,7 +221,6 @@ def create_calendar_event(reservation):
 # Flex Messageテンプレート
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def build_welcome_flex():
-    """ウェルカムメッセージ"""
     return {
         "type": "bubble",
         "hero": {
@@ -317,7 +297,6 @@ def build_welcome_flex():
 
 
 def build_menu_flex():
-    """メニュー選択カルーセル"""
     bubbles = []
     for item in MENU_ITEMS:
         bubble = {
@@ -327,12 +306,7 @@ def build_menu_flex():
                 "type": "box",
                 "layout": "vertical",
                 "contents": [
-                    {
-                        "type": "text",
-                        "text": item["emoji"],
-                        "size": "3xl",
-                        "align": "center",
-                    },
+                    {"type": "text", "text": item["emoji"], "size": "3xl", "align": "center"},
                     {
                         "type": "text",
                         "text": item["name"],
@@ -381,12 +355,10 @@ def build_menu_flex():
             },
         }
         bubbles.append(bubble)
-
     return {"type": "carousel", "contents": bubbles}
 
 
 def build_guests_flex():
-    """人数選択"""
     buttons = []
     for n in range(1, 9):
         buttons.append(
@@ -403,7 +375,6 @@ def build_guests_flex():
             }
         )
 
-    # 2列に並べる
     rows = []
     for i in range(0, len(buttons), 2):
         row = {
@@ -420,12 +391,7 @@ def build_guests_flex():
             "type": "box",
             "layout": "vertical",
             "contents": [
-                {
-                    "type": "text",
-                    "text": "👥 人数を選択",
-                    "weight": "bold",
-                    "size": "lg",
-                },
+                {"type": "text", "text": "👥 人数を選択", "weight": "bold", "size": "lg"},
                 {
                     "type": "text",
                     "text": "ご来店人数をお選びください",
@@ -433,10 +399,7 @@ def build_guests_flex():
                     "color": "#666666",
                     "margin": "md",
                 },
-                {
-                    "type": "separator",
-                    "margin": "lg",
-                },
+                {"type": "separator", "margin": "lg"},
                 *rows,
             ],
         },
@@ -444,17 +407,14 @@ def build_guests_flex():
 
 
 def build_date_flex():
-    """日付選択（7日分）"""
     today = datetime.datetime.now(JST)
     buttons = []
-
-    for i in range(1, 8):  # 明日から7日間
+    for i in range(1, 8):
         d = today + datetime.timedelta(days=i)
         weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
         wd = weekday_jp[d.weekday()]
         date_str = d.strftime("%Y-%m-%d")
         label = f"{d.month}/{d.day}（{wd}）"
-
         buttons.append(
             {
                 "type": "button",
@@ -468,19 +428,13 @@ def build_date_flex():
                 "margin": "sm",
             }
         )
-
     return {
         "type": "bubble",
         "body": {
             "type": "box",
             "layout": "vertical",
             "contents": [
-                {
-                    "type": "text",
-                    "text": "📅 日付を選択",
-                    "weight": "bold",
-                    "size": "lg",
-                },
+                {"type": "text", "text": "📅 日付を選択", "weight": "bold", "size": "lg"},
                 {
                     "type": "text",
                     "text": "ご希望の日をお選びください",
@@ -496,7 +450,6 @@ def build_date_flex():
 
 
 def build_time_flex(available_slots):
-    """時間帯選択"""
     if not available_slots:
         return {
             "type": "bubble",
@@ -504,12 +457,7 @@ def build_time_flex(available_slots):
                 "type": "box",
                 "layout": "vertical",
                 "contents": [
-                    {
-                        "type": "text",
-                        "text": "😢 空き枠なし",
-                        "weight": "bold",
-                        "size": "lg",
-                    },
+                    {"type": "text", "text": "😢 空き枠なし", "weight": "bold", "size": "lg"},
                     {
                         "type": "text",
                         "text": "この日は満席です。別の日をお選びください。",
@@ -539,7 +487,7 @@ def build_time_flex(available_slots):
         }
 
     buttons = []
-    for slot in available_slots[:12]:  # 最大12スロット表示
+    for slot in available_slots[:12]:
         label = f"{slot['time']}〜（残{slot['available']}席）"
         buttons.append(
             {
@@ -561,12 +509,7 @@ def build_time_flex(available_slots):
             "type": "box",
             "layout": "vertical",
             "contents": [
-                {
-                    "type": "text",
-                    "text": "🕐 時間を選択",
-                    "weight": "bold",
-                    "size": "lg",
-                },
+                {"type": "text", "text": "🕐 時間を選択", "weight": "bold", "size": "lg"},
                 {
                     "type": "text",
                     "text": "ご希望の時間帯をお選びください",
@@ -581,11 +524,28 @@ def build_time_flex(available_slots):
     }
 
 
+def _detail_row(label, value, bold=False):
+    return {
+        "type": "box",
+        "layout": "horizontal",
+        "contents": [
+            {"type": "text", "text": label, "size": "sm", "color": "#999999", "flex": 2},
+            {
+                "type": "text",
+                "text": value,
+                "size": "sm",
+                "weight": "bold" if bold else "regular",
+                "color": "#E05241" if bold else "#333333",
+                "flex": 3,
+                "wrap": True,
+            },
+        ],
+    }
+
+
 def build_confirm_flex(session):
-    """予約確認画面"""
     menu = next((m for m in MENU_ITEMS if m["id"] == session["menu"]), None)
     total = menu["price"] * session["guests"]
-
     date_obj = datetime.datetime.strptime(session["date"], "%Y-%m-%d")
     weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
     date_display = f"{date_obj.month}/{date_obj.day}（{weekday_jp[date_obj.weekday()]}）"
@@ -596,12 +556,7 @@ def build_confirm_flex(session):
             "type": "box",
             "layout": "vertical",
             "contents": [
-                {
-                    "type": "text",
-                    "text": "📋 予約内容の確認",
-                    "weight": "bold",
-                    "size": "lg",
-                },
+                {"type": "text", "text": "📋 予約内容の確認", "weight": "bold", "size": "lg"},
                 {"type": "separator", "margin": "lg"},
                 {
                     "type": "box",
@@ -650,33 +605,7 @@ def build_confirm_flex(session):
     }
 
 
-def _detail_row(label, value, bold=False):
-    return {
-        "type": "box",
-        "layout": "horizontal",
-        "contents": [
-            {
-                "type": "text",
-                "text": label,
-                "size": "sm",
-                "color": "#999999",
-                "flex": 2,
-            },
-            {
-                "type": "text",
-                "text": value,
-                "size": "sm",
-                "weight": "bold" if bold else "regular",
-                "color": "#E05241" if bold else "#333333",
-                "flex": 3,
-                "wrap": True,
-            },
-        ],
-    }
-
-
 def build_complete_flex(session):
-    """予約完了画面"""
     menu = next((m for m in MENU_ITEMS if m["id"] == session["menu"]), None)
     date_obj = datetime.datetime.strptime(session["date"], "%Y-%m-%d")
     weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
@@ -688,12 +617,7 @@ def build_complete_flex(session):
             "type": "box",
             "layout": "vertical",
             "contents": [
-                {
-                    "type": "text",
-                    "text": "🎉",
-                    "size": "3xl",
-                    "align": "center",
-                },
+                {"type": "text", "text": "🎉", "size": "3xl", "align": "center"},
                 {
                     "type": "text",
                     "text": "予約が完了しました！",
@@ -732,61 +656,25 @@ def build_complete_flex(session):
 # LINEメッセージ送信ヘルパー
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def reply_flex(reply_token, alt_text, flex_content):
-    """Flex Messageで返信"""
-    with ApiClient(configuration) as api_client:
-        api = MessagingApi(api_client)
-        api.reply_message(
-            ReplyMessageRequest(
-                replyToken=reply_token,
-                messages=[
-                    FlexMessage(
-                        altText=alt_text,
-                        contents=FlexContainer.from_dict(flex_content),
-                    )
-                ],
-            )
-        )
+    line_bot_api.reply_message(
+        reply_token,
+        FlexSendMessage(alt_text=alt_text, contents=flex_content),
+    )
 
 
 def reply_text(reply_token, text):
-    """テキストで返信"""
-    with ApiClient(configuration) as api_client:
-        api = MessagingApi(api_client)
-        api.reply_message(
-            ReplyMessageRequest(
-                replyToken=reply_token,
-                messages=[TextMessage(text=text)],
-            )
-        )
+    line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
 
 
 def push_text(user_id, text):
-    """プッシュメッセージ送信"""
-    with ApiClient(configuration) as api_client:
-        api = MessagingApi(api_client)
-        api.push_message(
-            PushMessageRequest(
-                to=user_id,
-                messages=[TextMessage(text=text)],
-            )
-        )
+    line_bot_api.push_message(user_id, TextSendMessage(text=text))
 
 
 def push_flex(user_id, alt_text, flex_content):
-    """Flex Messageをプッシュ送信"""
-    with ApiClient(configuration) as api_client:
-        api = MessagingApi(api_client)
-        api.push_message(
-            PushMessageRequest(
-                to=user_id,
-                messages=[
-                    FlexMessage(
-                        altText=alt_text,
-                        contents=FlexContainer.from_dict(flex_content),
-                    )
-                ],
-            )
-        )
+    line_bot_api.push_message(
+        user_id,
+        FlexSendMessage(alt_text=alt_text, contents=flex_content),
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -815,17 +703,14 @@ def health():
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @handler.add(FollowEvent)
 def handle_follow(event):
-    """友だち追加時"""
     reply_flex(event.reply_token, f"{STORE_NAME} LINE予約", build_welcome_flex())
 
 
-@handler.add(MessageEvent, message=TextMessageContent)
+@handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    """テキストメッセージ受信"""
     user_id = event.source.user_id
     text = event.message.text.strip()
 
-    # 予約フロー中のテキスト入力処理
     session = reservation_sessions.get(user_id)
     if session:
         if session["step"] == "name":
@@ -839,7 +724,6 @@ def handle_message(event):
             reply_flex(event.reply_token, "予約内容の確認", build_confirm_flex(session))
             return
 
-    # キーワード対応
     if text in ["予約", "予約する", "予約したい"]:
         reply_flex(event.reply_token, f"{STORE_NAME} LINE予約", build_welcome_flex())
     elif text in ["メニュー", "コース"]:
@@ -857,7 +741,6 @@ def handle_message(event):
 
 @handler.add(PostbackEvent)
 def handle_postback(event):
-    """ポストバックイベント処理"""
     user_id = event.source.user_id
     data = dict(x.split("=") for x in event.postback.data.split("&"))
     action = data.get("action")
@@ -891,7 +774,6 @@ def handle_postback(event):
             reply_flex(event.reply_token, "日付選択", build_date_flex())
             return
 
-        # 空き枠を取得
         menu = next((m for m in MENU_ITEMS if m["id"] == session.get("menu")), None)
         duration = menu["duration"] if menu else 60
         slots = get_available_slots(session["date"], session["guests"], duration)
@@ -910,21 +792,14 @@ def handle_postback(event):
             reply_text(event.reply_token, "セッションが切れました。「予約」と送信してやり直してください。")
             return
 
-        # Googleカレンダーに登録
         event_id = create_calendar_event(session)
         session["calendar_event_id"] = event_id
         session["confirmed_at"] = datetime.datetime.now(JST).isoformat()
-
-        # 予約を保存
         confirmed_reservations.append(session.copy())
 
-        # 完了メッセージ
         reply_flex(event.reply_token, "予約完了", build_complete_flex(session))
-
-        # オーナーに通知
         notify_owner(session)
 
-        # セッションクリア
         del reservation_sessions[user_id]
 
     elif action == "cancel_reservation":
@@ -937,7 +812,6 @@ def handle_postback(event):
 
 
 def check_user_reservations(reply_token, user_id):
-    """ユーザーの予約を確認"""
     now = datetime.datetime.now(JST)
     user_reservations = [
         r
@@ -963,13 +837,11 @@ def check_user_reservations(reply_token, user_id):
             f" {r['time']}〜\n"
             f"  {menu['name'] if menu else '不明'} / {r['guests']}名"
         )
-
     reply_text(reply_token, "\n".join(lines))
 
 
 def notify_owner(session):
-    """オーナーにLINE通知"""
-    if not OWNER_LINE_USER_ID:
+    if not OWNER_LINE_USER_ID or OWNER_LINE_USER_ID == "dummy":
         logger.warning("OWNER_LINE_USER_ID未設定: オーナー通知スキップ")
         return
 
@@ -994,10 +866,9 @@ def notify_owner(session):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 前日リマインド（スケジューラー）
+# 前日リマインド
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def send_reminders():
-    """前日リマインドを送信"""
     tomorrow = (datetime.datetime.now(JST) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
     for r in confirmed_reservations:
@@ -1025,7 +896,6 @@ def send_reminders():
                 logger.error(f"リマインド送信エラー: {e}")
 
 
-# スケジューラー設定（毎日18:00にリマインド送信）
 scheduler = BackgroundScheduler(timezone="Asia/Tokyo")
 scheduler.add_job(send_reminders, "cron", hour=18, minute=0)
 scheduler.start()
