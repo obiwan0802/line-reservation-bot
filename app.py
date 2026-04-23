@@ -120,8 +120,8 @@ def get_reserved_slots(date_str):
         return []
 
 
-def count_reserved_seats(date_str, time_str):
-    events = get_reserved_slots(date_str)
+def count_reserved_seats_from_events(events, time_str, date_str):
+    """事前取得済みのイベントリストから指定時刻の予約席数を計算（API呼び出しなし）"""
     target_time = datetime.datetime.strptime(
         f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
     ).replace(tzinfo=JST)
@@ -146,6 +146,9 @@ def get_available_slots(date_str, guests, duration_minutes):
     now = datetime.datetime.now(JST)
     target_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=JST)
 
+    # ★ カレンダーAPIを1回だけ呼び出してキャッシュ
+    events = get_reserved_slots(date_str)
+
     slots = []
     hour = STORE_OPEN_HOUR
     minute = 0
@@ -167,7 +170,8 @@ def get_available_slots(date_str, guests, duration_minutes):
         ):
             break
 
-        reserved = count_reserved_seats(date_str, time_str)
+        # ★ キャッシュしたイベントを使って計算（APIコールなし）
+        reserved = count_reserved_seats_from_events(events, time_str, date_str)
         available = MAX_SEATS - reserved
         if available >= guests:
             slots.append({"time": time_str, "available": available})
@@ -774,10 +778,13 @@ def handle_postback(event):
             reply_flex(event.reply_token, "日付選択", build_date_flex())
             return
 
+        # 先に「検索中」と返信してから、空き枠をプッシュ送信
+        reply_text(event.reply_token, "🔍 空き状況を確認しています...\n少々お待ちください")
+
         menu = next((m for m in MENU_ITEMS if m["id"] == session.get("menu")), None)
         duration = menu["duration"] if menu else 60
         slots = get_available_slots(session["date"], session["guests"], duration)
-        reply_flex(event.reply_token, "時間選択", build_time_flex(slots))
+        push_flex(user_id, "時間選択", build_time_flex(slots))
 
     elif action == "select_time":
         session = reservation_sessions.get(user_id, {})
