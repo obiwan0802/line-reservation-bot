@@ -1021,9 +1021,12 @@ def check_dashboard_auth():
 def dashboard_page():
     """ダッシュボード画面"""
     check_dashboard_auth()
-    return render_template("dashboard.html",
-                           store_name=STORE_NAME,
-                           token=request.args.get("token"))
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+    with open(html_path, encoding="utf-8") as f:
+        html = f.read()
+    html = html.replace("{{ store_name }}", STORE_NAME)
+    html = html.replace("{{ token }}", request.args.get("token", ""))
+    return html
 
 
 # --- 予約API ---
