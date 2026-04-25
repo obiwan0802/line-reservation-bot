@@ -472,39 +472,37 @@ def build_guests_flex():
 
 def build_date_flex():
     today = datetime.datetime.now(JST)
-    weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
-    buttons = []
-    for i in range(1, 8):
-        d = today + datetime.timedelta(days=i)
-        date_str = d.strftime("%Y-%m-%d")
-
-        # 定休日チェック — 定休日はラベルに表示
-        if db_is_closed_day(date_str):
-            buttons.append({
-                "type": "button",
-                "action": {"type": "postback", "label": f"{d.month}/{d.day}（{weekday_jp[d.weekday()]}）定休日",
-                           "data": "action=closed_day"},
-                "style": "secondary", "height": "sm", "margin": "sm",
-                "color": "#CCCCCC",
-            })
-        else:
-            buttons.append({
-                "type": "button",
-                "action": {"type": "postback",
-                           "label": f"{d.month}/{d.day}（{weekday_jp[d.weekday()]}）",
-                           "data": f"action=select_date&date={date_str}"},
-                "style": "secondary", "height": "sm", "margin": "sm",
-            })
+    tomorrow = today + datetime.timedelta(days=1)
+    max_date = today + datetime.timedelta(days=62)  # 約2ヶ月先まで
     return {
         "type": "bubble",
         "body": {
             "type": "box", "layout": "vertical",
             "contents": [
                 {"type": "text", "text": "📅 日付を選択", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "ご希望の日をお選びください",
-                 "size": "sm", "color": "#666666", "margin": "md"},
-                {"type": "separator", "margin": "lg"},
-                *buttons,
+                {"type": "text", "text": "カレンダーからご希望の日をお選びください",
+                 "size": "sm", "color": "#666666", "margin": "md", "wrap": True},
+                {"type": "text", "text": f"※ {tomorrow.month}/{tomorrow.day} 〜 {max_date.month}/{max_date.day} の範囲で選択できます",
+                 "size": "xs", "color": "#999999", "margin": "sm", "wrap": True},
+            ],
+        },
+        "footer": {
+            "type": "box", "layout": "vertical",
+            "contents": [
+                {
+                    "type": "button",
+                    "action": {
+                        "type": "datetimepicker",
+                        "label": "📅 カレンダーを開く",
+                        "data": "action=select_date",
+                        "mode": "date",
+                        "initial": tomorrow.strftime("%Y-%m-%d"),
+                        "min": tomorrow.strftime("%Y-%m-%d"),
+                        "max": max_date.strftime("%Y-%m-%d"),
+                    },
+                    "style": "primary",
+                    "color": "#E05241",
+                },
             ],
         },
     }
@@ -776,22 +774,37 @@ def handle_postback(event):
         session["guests"] = int(data["guests"])
         session["step"] = "date"
         reservation_sessions[user_id] = session
-        reply_text(event.reply_token, "📅 日程を確認しています...\n少々お待ちください")
-        push_flex(user_id, "日付選択", build_date_flex())
+        reply_flex(event.reply_token, "日付選択", build_date_flex())
 
     elif action == "closed_day":
         reply_text(event.reply_token, "🚫 その日は定休日です。別の日をお選びください。")
 
     elif action == "select_date" or action == "reselect_date":
         session = reservation_sessions.get(user_id, {})
-        if action == "select_date":
-            session["date"] = data["date"]
-        session["step"] = "time"
-        reservation_sessions[user_id] = session
 
         if action == "reselect_date":
             reply_flex(event.reply_token, "日付選択", build_date_flex())
             return
+
+        # カレンダーピッカーから日付を取得
+        selected_date = None
+        if hasattr(event.postback, 'params') and event.postback.params:
+            selected_date = event.postback.params.get('date')
+        if not selected_date:
+            selected_date = data.get("date")
+        if not selected_date:
+            reply_text(event.reply_token, "日付の取得に失敗しました。もう一度お試しください。")
+            return
+
+        # 定休日チェック（カレンダー選択後に判定）
+        if db_is_closed_day(selected_date):
+            reply_text(event.reply_token, "🚫 申し訳ありません、その日は定休日です。\n別の日をお選びください。")
+            push_flex(user_id, "日付選択", build_date_flex())
+            return
+
+        session["date"] = selected_date
+        session["step"] = "time"
+        reservation_sessions[user_id] = session
 
         reply_text(event.reply_token, "🔍 空き状況を確認しています...\n少々お待ちください")
         menu = next((m for m in MENU_ITEMS if m["id"] == session.get("menu")), None)
