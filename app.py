@@ -25,10 +25,11 @@ from linebot.models import (
     FlexSendMessage,
 )
 
+import requests as http_requests
+
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-from supabase import create_client, Client
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -64,8 +65,34 @@ JST = ZoneInfo("Asia/Tokyo")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# Supabase初期化
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
+# Supabase REST APIヘルパー
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation",
+}
+
+def supabase_get(table, params=None):
+    """Supabase REST API GET"""
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    res = http_requests.get(url, headers=SUPABASE_HEADERS, params=params or {})
+    res.raise_for_status()
+    return res.json()
+
+def supabase_post(table, data):
+    """Supabase REST API POST (INSERT)"""
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    res = http_requests.post(url, headers=SUPABASE_HEADERS, json=data)
+    res.raise_for_status()
+    return res.json()
+
+def supabase_patch(table, data, params):
+    """Supabase REST API PATCH (UPDATE)"""
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    res = http_requests.patch(url, headers=SUPABASE_HEADERS, json=data, params=params)
+    res.raise_for_status()
+    return res.json()
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # メニュー設定
@@ -88,14 +115,14 @@ reservation_sessions = {}
 def db_get_or_create_customer(line_user_id, display_name=None):
     """顧客を取得、なければ新規作成"""
     try:
-        res = supabase.table("customers").select("*").eq("line_user_id", line_user_id).execute()
-        if res.data:
-            return res.data[0]
-        new = supabase.table("customers").insert({
+        rows = supabase_get("customers", {"line_user_id": f"eq.{line_user_id}", "select": "*"})
+        if rows:
+            return rows[0]
+        new = supabase_post("customers", {
             "line_user_id": line_user_id,
             "display_name": display_name,
-        }).execute()
-        return new.data[0] if new.data else None
+        })
+        return new[0] if new else None
     except Exception as e:
         logger.error(f"顧客DB操作エラー: {e}")
         return None
@@ -104,8 +131,8 @@ def db_get_or_create_customer(line_user_id, display_name=None):
 def db_save_reservation(reservation_data):
     """予約をDBに保存"""
     try:
-        res = supabase.table("reservations").insert(reservation_data).execute()
-        return res.data[0] if res.data else None
+        res = supabase_post("reservations", reservation_data)
+        return res[0] if res else None
     except Exception as e:
         logger.error(f"予約保存エラー: {e}")
         return None
@@ -115,17 +142,14 @@ def db_get_user_reservations(line_user_id):
     """ユーザーの未来の有効な予約を取得"""
     today = datetime.datetime.now(JST).strftime("%Y-%m-%d")
     try:
-        res = (
-            supabase.table("reservations")
-            .select("*")
-            .eq("line_user_id", line_user_id)
-            .eq("status", "confirmed")
-            .gte("reservation_date", today)
-            .order("reservation_date")
-            .order("reservation_time")
-            .execute()
-        )
-        return res.data or []
+        rows = supabase_get("reservations", {
+            "select": "*",
+            "line_user_id": f"eq.{line_user_id}",
+            "status": "eq.confirmed",
+            "reservation_date": f"gte.{today}",
+            "order": "reservation_date.asc,reservation_time.asc",
+        })
+        return rows or []
     except Exception as e:
         logger.error(f"予約取得エラー: {e}")
         return []
@@ -134,14 +158,11 @@ def db_get_user_reservations(line_user_id):
 def db_cancel_reservation(reservation_id, line_user_id):
     """予約をキャンセル"""
     try:
-        res = (
-            supabase.table("reservations")
-            .update({"status": "cancelled"})
-            .eq("id", reservation_id)
-            .eq("line_user_id", line_user_id)
-            .execute()
-        )
-        return bool(res.data)
+        res = supabase_patch("reservations", {"status": "cancelled"}, {
+            "id": f"eq.{reservation_id}",
+            "line_user_id": f"eq.{line_user_id}",
+        })
+        return bool(res)
     except Exception as e:
         logger.error(f"キャンセルエラー: {e}")
         return False
@@ -150,14 +171,12 @@ def db_cancel_reservation(reservation_id, line_user_id):
 def db_get_reservations_by_date(date_str):
     """指定日の有効な予約を全件取得"""
     try:
-        res = (
-            supabase.table("reservations")
-            .select("*")
-            .eq("reservation_date", date_str)
-            .eq("status", "confirmed")
-            .execute()
-        )
-        return res.data or []
+        rows = supabase_get("reservations", {
+            "select": "*",
+            "reservation_date": f"eq.{date_str}",
+            "status": "eq.confirmed",
+        })
+        return rows or []
     except Exception as e:
         logger.error(f"日付別予約取得エラー: {e}")
         return []
@@ -167,15 +186,13 @@ def db_get_tomorrow_reminders():
     """翌日の未リマインド予約を取得"""
     tomorrow = (datetime.datetime.now(JST) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
     try:
-        res = (
-            supabase.table("reservations")
-            .select("*")
-            .eq("reservation_date", tomorrow)
-            .eq("status", "confirmed")
-            .eq("reminded", False)
-            .execute()
-        )
-        return res.data or []
+        rows = supabase_get("reservations", {
+            "select": "*",
+            "reservation_date": f"eq.{tomorrow}",
+            "status": "eq.confirmed",
+            "reminded": "eq.false",
+        })
+        return rows or []
     except Exception as e:
         logger.error(f"リマインド取得エラー: {e}")
         return []
@@ -184,7 +201,7 @@ def db_get_tomorrow_reminders():
 def db_mark_reminded(reservation_id):
     """リマインド送信済みにマーク"""
     try:
-        supabase.table("reservations").update({"reminded": True}).eq("id", reservation_id).execute()
+        supabase_patch("reservations", {"reminded": True}, {"id": f"eq.{reservation_id}"})
     except Exception as e:
         logger.error(f"リマインド更新エラー: {e}")
 
@@ -199,7 +216,7 @@ def db_update_customer_visit(line_user_id, name=None, phone=None):
                 update_data["display_name"] = name
             if phone:
                 update_data["phone"] = phone
-            supabase.table("customers").update(update_data).eq("line_user_id", line_user_id).execute()
+            supabase_patch("customers", update_data, {"line_user_id": f"eq.{line_user_id}"})
     except Exception as e:
         logger.error(f"顧客更新エラー: {e}")
 
@@ -211,24 +228,20 @@ def db_is_closed_day(date_str):
         day_of_week = date_obj.weekday()  # 0=月〜6=日
 
         # 特定日の休業チェック
-        res1 = (
-            supabase.table("closed_days")
-            .select("*")
-            .eq("closed_date", date_str)
-            .execute()
-        )
-        if res1.data:
+        rows1 = supabase_get("closed_days", {
+            "select": "*",
+            "closed_date": f"eq.{date_str}",
+        })
+        if rows1:
             return True
 
         # 毎週の定休日チェック
-        res2 = (
-            supabase.table("closed_days")
-            .select("*")
-            .eq("day_of_week", day_of_week)
-            .eq("is_recurring", True)
-            .execute()
-        )
-        if res2.data:
+        rows2 = supabase_get("closed_days", {
+            "select": "*",
+            "day_of_week": f"eq.{day_of_week}",
+            "is_recurring": "eq.true",
+        })
+        if rows2:
             return True
 
         return False
@@ -881,9 +894,9 @@ def handle_postback(event):
 
         # カレンダーからも削除
         try:
-            res = supabase.table("reservations").select("*").eq("id", rid).execute()
-            if res.data:
-                delete_calendar_event(res.data[0].get("calendar_event_id"))
+            rows = supabase_get("reservations", {"select": "*", "id": f"eq.{rid}"})
+            if rows:
+                delete_calendar_event(rows[0].get("calendar_event_id"))
         except Exception as e:
             logger.error(f"キャンセル時カレンダー削除エラー: {e}")
 
