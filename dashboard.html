@@ -104,8 +104,8 @@ tr:hover { background:#fafafa; }
     <div class="stats" id="reservation-stats"></div>
 
     <div class="filter-bar">
-      <button class="filter-btn active" onclick="filterReservations('today',this)">今日</button>
-      <button class="filter-btn" onclick="filterReservations('week',this)">今週</button>
+      <button class="filter-btn" onclick="filterReservations('today',this)">今日</button>
+      <button class="filter-btn active" onclick="filterReservations('week',this)">今週</button>
       <button class="filter-btn" onclick="filterReservations('month',this)">今月</button>
       <button class="filter-btn" onclick="filterReservations('all',this)">すべて</button>
     </div>
@@ -235,7 +235,7 @@ function switchTab(name) {
 }
 
 // === 予約管理 ===
-let currentFilter = "today";
+let currentFilter = "week";
 let allReservations = [];
 
 function filterReservations(period, btn) {
