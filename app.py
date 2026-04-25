@@ -98,6 +98,7 @@ def supabase_patch(table, data, params):
 # メニュー設定
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MENU_ITEMS = [
+    {"id": "seat_only", "name": "席のみ予約", "price": 0, "duration": 120, "emoji": "💺"},
     {"id": "lunch_a", "name": "ランチコースA", "price": 1500, "duration": 60, "emoji": "🍽️"},
     {"id": "lunch_b", "name": "ランチコースB", "price": 2500, "duration": 90, "emoji": "🥗"},
     {"id": "dinner_standard", "name": "ディナースタンダード", "price": 4000, "duration": 90, "emoji": "🍷"},
@@ -775,7 +776,8 @@ def handle_postback(event):
         session["guests"] = int(data["guests"])
         session["step"] = "date"
         reservation_sessions[user_id] = session
-        reply_flex(event.reply_token, "日付選択", build_date_flex())
+        reply_text(event.reply_token, "📅 日程を確認しています...\n少々お待ちください")
+        push_flex(user_id, "日付選択", build_date_flex())
 
     elif action == "closed_day":
         reply_text(event.reply_token, "🚫 その日は定休日です。別の日をお選びください。")
