@@ -1,10 +1,11 @@
 """
-飲食店向け LINE予約Bot — Phase 1（Supabase対応版）
+飲食店向け LINE予約Bot — Phase 2（オーナーダッシュボード付き）
 - Supabaseデータベースで予約・顧客データを永続化
 - キャンセル・変更機能
 - 定休日・臨時休業対応
 - Googleカレンダー連携
 - オーナーLINE通知 / 前日リマインド
+- Webダッシュボード（予約管理・定休日設定・顧客リスト）
 """
 
 import os
@@ -13,7 +14,7 @@ import datetime
 import logging
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request, abort
+from flask import Flask, request, abort, render_template, jsonify
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
@@ -58,6 +59,9 @@ STORE_OPEN_HOUR = int(os.environ.get("STORE_OPEN_HOUR", "11"))
 STORE_CLOSE_HOUR = int(os.environ.get("STORE_CLOSE_HOUR", "22"))
 MAX_SEATS = int(os.environ.get("MAX_SEATS", "30"))
 SLOT_INTERVAL_MINUTES = int(os.environ.get("SLOT_INTERVAL_MINUTES", "30"))
+
+# ダッシュボード
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "admin1234")
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -1001,6 +1005,129 @@ def send_reminders():
 scheduler = BackgroundScheduler(timezone="Asia/Tokyo")
 scheduler.add_job(send_reminders, "cron", hour=18, minute=0)
 scheduler.start()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# オーナーダッシュボード
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def check_dashboard_auth():
+    """ダッシュボード認証チェック"""
+    token = request.args.get("token") or request.headers.get("X-Dashboard-Token")
+    if not token or token != DASHBOARD_PASSWORD:
+        abort(401)
+
+
+@app.route("/dashboard")
+def dashboard_page():
+    """ダッシュボード画面"""
+    check_dashboard_auth()
+    return render_template("dashboard.html",
+                           store_name=STORE_NAME,
+                           token=request.args.get("token"))
+
+
+# --- 予約API ---
+@app.route("/api/reservations")
+def api_get_reservations():
+    check_dashboard_auth()
+    date_from = request.args.get("date_from", datetime.datetime.now(JST).strftime("%Y-%m-%d"))
+    status_filter = request.args.get("status", "")
+    params = {
+        "select": "*",
+        "reservation_date": f"gte.{date_from}",
+        "order": "reservation_date.asc,reservation_time.asc",
+    }
+    if status_filter:
+        params["status"] = f"eq.{status_filter}"
+    try:
+        rows = supabase_get("reservations", params)
+        return jsonify({"data": rows})
+    except Exception as e:
+        logger.error(f"API予約取得エラー: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/reservations/<int:rid>/cancel", methods=["POST"])
+def api_cancel_reservation(rid):
+    check_dashboard_auth()
+    try:
+        # カレンダーからも削除
+        rows = supabase_get("reservations", {"select": "*", "id": f"eq.{rid}"})
+        if rows:
+            delete_calendar_event(rows[0].get("calendar_event_id"))
+            line_user_id = rows[0].get("line_user_id")
+
+        res = supabase_patch("reservations", {"status": "cancelled"}, {"id": f"eq.{rid}"})
+
+        # お客様にキャンセル通知
+        if rows and line_user_id:
+            try:
+                r = rows[0]
+                push_text(line_user_id,
+                    f"⚠️ ご予約がキャンセルされました\n\n"
+                    f"📅 {r['reservation_date']} {r['reservation_time']}〜\n"
+                    f"🍽️ {r['menu_name']}\n"
+                    f"👥 {r['guests']}名\n\n"
+                    f"ご不明な点がございましたらお問い合わせください。")
+            except Exception:
+                pass
+
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"APIキャンセルエラー: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 定休日API ---
+@app.route("/api/closed-days")
+def api_get_closed_days():
+    check_dashboard_auth()
+    try:
+        rows = supabase_get("closed_days", {"select": "*", "order": "day_of_week.asc,closed_date.asc"})
+        return jsonify({"data": rows})
+    except Exception as e:
+        logger.error(f"API定休日取得エラー: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/closed-days", methods=["POST"])
+def api_add_closed_day():
+    check_dashboard_auth()
+    body = request.get_json()
+    try:
+        res = supabase_post("closed_days", body)
+        return jsonify({"data": res})
+    except Exception as e:
+        logger.error(f"API定休日追加エラー: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/closed-days/<int:cid>", methods=["DELETE"])
+def api_delete_closed_day(cid):
+    check_dashboard_auth()
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/closed_days"
+        res = http_requests.delete(url, headers=SUPABASE_HEADERS, params={"id": f"eq.{cid}"})
+        res.raise_for_status()
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"API定休日削除エラー: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 顧客API ---
+@app.route("/api/customers")
+def api_get_customers():
+    check_dashboard_auth()
+    try:
+        rows = supabase_get("customers", {
+            "select": "*",
+            "order": "visit_count.desc,created_at.desc",
+        })
+        return jsonify({"data": rows})
+    except Exception as e:
+        logger.error(f"API顧客取得エラー: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
