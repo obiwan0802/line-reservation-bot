@@ -12,6 +12,7 @@ import os
 import json
 import datetime
 import logging
+import calendar as cal_module
 from zoneinfo import ZoneInfo
 
 from flask import Flask, request, abort, render_template, jsonify
@@ -517,41 +518,121 @@ def build_guests_flex():
 
 
 def build_date_flex():
+    """カレンダー型の日付選択（3ヶ月分カルーセル）"""
     today = datetime.datetime.now(JST)
-    tomorrow = today + datetime.timedelta(days=1)
-    max_date = today + datetime.timedelta(days=62)  # 約2ヶ月先まで
-    return {
-        "type": "bubble",
-        "body": {
-            "type": "box", "layout": "vertical",
+    today_date = today.date()
+
+    # 定休日データを一括取得（APIコール削減）
+    try:
+        all_closed = supabase_get("closed_days", {"select": "*"})
+    except Exception:
+        all_closed = []
+
+    recurring_dows = set()
+    specific_dates = set()
+    for c in all_closed:
+        if c.get("is_recurring") and c.get("day_of_week") is not None:
+            recurring_dows.add(c["day_of_week"])
+        if c.get("closed_date"):
+            specific_dates.add(c["closed_date"])
+
+    def is_closed(d):
+        if d.weekday() in recurring_dows:
+            return True
+        return d.strftime("%Y-%m-%d") in specific_dates
+
+    weekday_labels = ["月", "火", "水", "木", "金", "土", "日"]
+    bubbles = []
+
+    for month_offset in range(3):
+        year = today.year
+        month = today.month + month_offset
+        while month > 12:
+            year += 1
+            month -= 12
+
+        weeks = cal_module.monthcalendar(year, month)
+
+        # 曜日ヘッダー
+        header_row = {
+            "type": "box", "layout": "horizontal", "margin": "md",
             "contents": [
-                {"type": "text", "text": "📅 日付を選択", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "カレンダーからご希望の日をお選びください",
-                 "size": "sm", "color": "#666666", "margin": "md", "wrap": True},
-                {"type": "text", "text": f"※ {tomorrow.month}/{tomorrow.day} 〜 {max_date.month}/{max_date.day} の範囲で選択できます",
-                 "size": "xs", "color": "#999999", "margin": "sm", "wrap": True},
+                {"type": "text", "text": wd, "size": "xxs", "align": "center", "flex": 1,
+                 "color": "#E05241" if i == 6 else "#1565c0" if i == 5 else "#888888"}
+                for i, wd in enumerate(weekday_labels)
             ],
-        },
-        "footer": {
-            "type": "box", "layout": "vertical",
-            "contents": [
-                {
-                    "type": "button",
-                    "action": {
-                        "type": "datetimepicker",
-                        "label": "📅 カレンダーを開く",
-                        "data": "action=select_date",
-                        "mode": "date",
-                        "initial": tomorrow.strftime("%Y-%m-%d"),
-                        "min": tomorrow.strftime("%Y-%m-%d"),
-                        "max": max_date.strftime("%Y-%m-%d"),
-                    },
-                    "style": "primary",
-                    "color": "#E05241",
-                },
-            ],
-        },
-    }
+        }
+
+        rows = [
+            {"type": "text", "text": f"{year}年{month}月", "weight": "bold",
+             "size": "md", "align": "center"},
+            {"type": "separator", "margin": "sm"},
+            header_row,
+        ]
+
+        for week in weeks:
+            row_contents = []
+            for i, day in enumerate(week):
+                if day == 0:
+                    row_contents.append({
+                        "type": "box", "layout": "vertical", "flex": 1,
+                        "contents": [{"type": "text", "text": " ", "size": "sm", "align": "center"}],
+                    })
+                else:
+                    d = datetime.date(year, month, day)
+                    date_str = d.strftime("%Y-%m-%d")
+                    is_past = d < today_date
+                    closed = is_closed(d)
+
+                    if is_past:
+                        row_contents.append({
+                            "type": "box", "layout": "vertical", "flex": 1,
+                            "contents": [{"type": "text", "text": str(day), "size": "sm",
+                                          "align": "center", "color": "#DDDDDD"}],
+                        })
+                    elif closed:
+                        row_contents.append({
+                            "type": "box", "layout": "vertical", "flex": 1,
+                            "action": {"type": "postback", "label": "定休日",
+                                       "data": "action=closed_day"},
+                            "contents": [{"type": "text", "text": str(day), "size": "sm",
+                                          "align": "center", "color": "#CCCCCC",
+                                          "decoration": "line-through"}],
+                        })
+                    elif d == today_date:
+                        row_contents.append({
+                            "type": "box", "layout": "vertical", "flex": 1,
+                            "action": {"type": "postback", "label": str(day),
+                                       "data": f"action=select_date&date={date_str}"},
+                            "contents": [{"type": "text", "text": str(day), "size": "sm",
+                                          "align": "center", "color": "#FFFFFF",
+                                          "weight": "bold"}],
+                            "backgroundColor": "#E05241", "cornerRadius": "14px",
+                        })
+                    else:
+                        color = "#E05241" if i == 6 else "#1565c0" if i == 5 else "#333333"
+                        row_contents.append({
+                            "type": "box", "layout": "vertical", "flex": 1,
+                            "action": {"type": "postback", "label": str(day),
+                                       "data": f"action=select_date&date={date_str}"},
+                            "contents": [{"type": "text", "text": str(day), "size": "sm",
+                                          "align": "center", "color": color}],
+                        })
+
+            rows.append({
+                "type": "box", "layout": "horizontal",
+                "contents": row_contents, "margin": "sm",
+            })
+
+        bubbles.append({
+            "type": "bubble", "size": "kilo",
+            "body": {
+                "type": "box", "layout": "vertical",
+                "contents": rows, "paddingAll": "12px",
+            },
+        })
+
+    return {"type": "carousel", "contents": bubbles}
 
 
 def build_time_flex(available_slots):
@@ -820,7 +901,8 @@ def handle_postback(event):
         session["guests"] = int(data["guests"])
         session["step"] = "date"
         reservation_sessions[user_id] = session
-        reply_flex(event.reply_token, "日付選択", build_date_flex())
+        reply_text(event.reply_token, "📅 カレンダーを準備しています...\n少々お待ちください")
+        push_flex(user_id, "日付選択", build_date_flex())
 
     elif action == "closed_day":
         reply_text(event.reply_token, "🚫 その日は定休日です。別の日をお選びください。")
@@ -832,12 +914,8 @@ def handle_postback(event):
             reply_flex(event.reply_token, "日付選択", build_date_flex())
             return
 
-        # カレンダーピッカーから日付を取得
-        selected_date = None
-        if hasattr(event.postback, 'params') and event.postback.params:
-            selected_date = event.postback.params.get('date')
-        if not selected_date:
-            selected_date = data.get("date")
+        # 日付を取得
+        selected_date = data.get("date")
         if not selected_date:
             reply_text(event.reply_token, "日付の取得に失敗しました。もう一度お試しください。")
             return
