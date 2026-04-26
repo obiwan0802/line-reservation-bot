@@ -76,6 +76,11 @@ tr:hover { background:#fafafa; }
 /* 空状態 */
 .empty { text-align:center; padding:40px; color:#999; font-size:14px; }
 
+/* 締切ボタン */
+.deadline-btn { background:#f0f0f0; color:#333; border:2px solid transparent; border-radius:8px; }
+.deadline-btn.active { background:#E05241; color:#fff; border-color:#E05241; }
+.deadline-btn[data-hours="0"].active { background:#2e7d32; border-color:#2e7d32; }
+
 /* レスポンシブ */
 @media(max-width:600px) {
   .tab { font-size:12px; padding:12px 4px; }
@@ -98,6 +103,22 @@ tr:hover { background:#fafafa; }
 </div>
 
 <div class="content">
+
+  <!-- ===== 予約受付コントロール ===== -->
+  <div class="card" id="deadline-control" style="margin-bottom:16px; border-left:4px solid #E05241;">
+    <div class="card-body" style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
+      <div>
+        <div style="font-weight:700; font-size:15px;">⏰ 予約受付の締切</div>
+        <div id="deadline-status" style="font-size:13px; color:#888; margin-top:4px;">読み込み中...</div>
+      </div>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <button class="btn deadline-btn" data-hours="0" onclick="setDeadline(0,this)" style="padding:8px 14px; font-size:13px;">今すぐOK</button>
+        <button class="btn deadline-btn" data-hours="1" onclick="setDeadline(1,this)" style="padding:8px 14px; font-size:13px;">1時間前</button>
+        <button class="btn deadline-btn" data-hours="2" onclick="setDeadline(2,this)" style="padding:8px 14px; font-size:13px;">2時間前</button>
+        <button class="btn deadline-btn" data-hours="3" onclick="setDeadline(3,this)" style="padding:8px 14px; font-size:13px;">3時間前</button>
+      </div>
+    </div>
+  </div>
 
   <!-- ===== 予約管理 ===== -->
   <div id="panel-reservations" class="panel active">
@@ -338,6 +359,41 @@ async function cancelReservation(id) {
   }
 }
 
+// === 予約締切設定 ===
+async function loadDeadline() {
+  try {
+    const res = await api("/api/settings/booking-deadline");
+    updateDeadlineUI(res.value);
+  } catch(e) {
+    document.getElementById("deadline-status").textContent = "設定を取得できませんでした";
+  }
+}
+
+function updateDeadlineUI(hours) {
+  const labels = {0:"今すぐ予約OK", 1:"1時間前に締切", 2:"2時間前に締切", 3:"3時間前に締切"};
+  const statusEl = document.getElementById("deadline-status");
+  if (hours === 0) {
+    statusEl.innerHTML = '🟢 <strong style="color:#2e7d32">今すぐ予約OK</strong> — 直前の予約を受け付けています';
+  } else {
+    statusEl.innerHTML = '🔒 <strong>' + hours + '時間前に締切</strong> — ' + hours + '時間以内の枠は予約できません';
+  }
+  document.querySelectorAll(".deadline-btn").forEach(b => {
+    b.classList.toggle("active", parseInt(b.dataset.hours) === hours);
+  });
+}
+
+async function setDeadline(hours, btn) {
+  try {
+    await api("/api/settings/booking-deadline", {
+      method: "POST",
+      body: JSON.stringify({hours: hours})
+    });
+    updateDeadlineUI(hours);
+  } catch(e) {
+    alert("設定の変更に失敗しました");
+  }
+}
+
 // === 定休日設定 ===
 async function loadClosedDays() {
   try {
@@ -456,6 +512,7 @@ function renderCustomerStats(rows) {
 }
 
 // === 初期読み込み ===
+loadDeadline();
 loadReservations();
 </script>
 </body>
