@@ -59,6 +59,7 @@ STORE_OPEN_HOUR = int(os.environ.get("STORE_OPEN_HOUR", "11"))
 STORE_CLOSE_HOUR = int(os.environ.get("STORE_CLOSE_HOUR", "22"))
 MAX_SEATS = int(os.environ.get("MAX_SEATS", "30"))
 SLOT_INTERVAL_MINUTES = int(os.environ.get("SLOT_INTERVAL_MINUTES", "30"))
+BOOKING_DEADLINE_HOURS = int(os.environ.get("BOOKING_DEADLINE_HOURS", "2"))  # 予約締切（何時間前）
 
 # ダッシュボード
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "admin1234")
@@ -319,6 +320,44 @@ def delete_calendar_event(event_id):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 店舗設定（DB）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def db_get_setting(key, default=None):
+    """設定値をDBから取得"""
+    try:
+        rows = supabase_get("store_settings", {"select": "value", "key": f"eq.{key}"})
+        if rows:
+            return rows[0]["value"]
+        return default
+    except Exception as e:
+        logger.error(f"設定取得エラー: {e}")
+        return default
+
+
+def db_set_setting(key, value):
+    """設定値をDBに保存（なければ作成、あれば更新）"""
+    try:
+        rows = supabase_get("store_settings", {"select": "key", "key": f"eq.{key}"})
+        if rows:
+            supabase_patch("store_settings", {"value": str(value)}, {"key": f"eq.{key}"})
+        else:
+            supabase_post("store_settings", {"key": key, "value": str(value)})
+    except Exception as e:
+        logger.error(f"設定保存エラー: {e}")
+
+
+def get_booking_deadline_hours():
+    """現在の予約締切時間を取得（時間単位）"""
+    val = db_get_setting("booking_deadline_hours")
+    if val is not None:
+        try:
+            return int(val)
+        except ValueError:
+            pass
+    return BOOKING_DEADLINE_HOURS
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 空き枠計算（DB版）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def get_available_slots(date_str, guests, duration_minutes):
@@ -340,7 +379,10 @@ def get_available_slots(date_str, guests, duration_minutes):
         time_str = f"{hour:02d}:{minute:02d}"
         slot_time = target_date.replace(hour=hour, minute=minute)
 
-        if slot_time <= now:
+        # 予約締切チェック（現在時刻 + 締切時間 以内の枠は除外）
+        deadline_hours = get_booking_deadline_hours()
+        deadline = now + datetime.timedelta(hours=deadline_hours)
+        if slot_time <= deadline:
             minute += SLOT_INTERVAL_MINUTES
             if minute >= 60:
                 hour += 1
@@ -1078,6 +1120,30 @@ def api_cancel_reservation(rid):
         return jsonify({"success": True})
     except Exception as e:
         logger.error(f"APIキャンセルエラー: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 設定API ---
+@app.route("/api/settings/booking-deadline")
+def api_get_booking_deadline():
+    check_dashboard_auth()
+    try:
+        hours = get_booking_deadline_hours()
+        return jsonify({"value": hours})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/booking-deadline", methods=["POST"])
+def api_set_booking_deadline():
+    check_dashboard_auth()
+    body = request.get_json()
+    hours = body.get("hours", 2)
+    try:
+        db_set_setting("booking_deadline_hours", int(hours))
+        return jsonify({"success": True, "value": int(hours)})
+    except Exception as e:
+        logger.error(f"API設定更新エラー: {e}")
         return jsonify({"error": str(e)}), 500
 
 
