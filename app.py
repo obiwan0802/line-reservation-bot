@@ -12,10 +12,13 @@ import os
 import json
 import datetime
 import logging
+import re
 import calendar as cal_module
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request, abort, render_template, jsonify
+from flask import Flask, request, abort, render_template, jsonify, session as flask_session, redirect, url_for
+from markupsafe import escape as html_escape
+from functools import wraps
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
@@ -38,6 +41,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # 設定
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(32).hex())
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -46,9 +50,9 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 OWNER_LINE_USER_ID = os.environ.get("OWNER_LINE_USER_ID", "")
 
-# Supabase
+# Supabase（service_role keyを使用 — RLSをバイパスしてサーバーから全操作可能）
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", os.environ.get("SUPABASE_KEY", ""))
 
 # Google Calendar
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "")
@@ -62,10 +66,68 @@ MAX_SEATS = int(os.environ.get("MAX_SEATS", "30"))
 SLOT_INTERVAL_MINUTES = int(os.environ.get("SLOT_INTERVAL_MINUTES", "30"))
 BOOKING_DEADLINE_HOURS = int(os.environ.get("BOOKING_DEADLINE_HOURS", "2"))  # 予約締切（何時間前）
 
-# ダッシュボード
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "admin1234")
+# ダッシュボード認証
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
+if not DASHBOARD_PASSWORD:
+    logger.warning("⚠️ DASHBOARD_PASSWORD が未設定です。必ず環境変数で設定してください。")
+
+BRAND_COLOR = "#E05241"  # 飲食店版（赤系）
 
 JST = ZoneInfo("Asia/Tokyo")
+
+
+def dashboard_auth_required(f):
+    """ダッシュボード用の認証デコレータ（セッションCookie方式）"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not flask_session.get("dashboard_authenticated"):
+            if request.is_json or request.path.startswith("/api/"):
+                return jsonify({"error": "Unauthorized"}), 401
+            return redirect(url_for("dashboard_login"))
+        return f(*args, **kwargs)
+    return decorated
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 入力バリデーション・サニタイズ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def sanitize_text(text, max_length=100):
+    """テキスト入力のサニタイズ（XSS対策 + 長さ制限）"""
+    if not isinstance(text, str):
+        return ""
+    text = str(html_escape(text.strip()))
+    return text[:max_length]
+
+
+def validate_phone(phone):
+    """電話番号バリデーション（日本の電話番号形式）"""
+    if not phone:
+        return True, ""  # 空は許容（任意入力の場合）
+    cleaned = re.sub(r"[\s\-‐‑‒–—―ー－]", "", phone)
+    if re.match(r"^(0\d{9,10}|\+81\d{9,10})$", cleaned):
+        return True, cleaned
+    return False, ""
+
+
+def validate_name(name):
+    """名前バリデーション"""
+    if not name or not name.strip():
+        return False, ""
+    name = name.strip()
+    if len(name) > 50:
+        return False, ""
+    # HTMLタグを除去
+    sanitized = re.sub(r"<[^>]+>", "", name)
+    return True, sanitized
+
+
+def validate_positive_int(value, max_val=999):
+    """正の整数バリデーション"""
+    try:
+        n = int(value)
+        return 1 <= n <= max_val, n
+    except (ValueError, TypeError):
+        return False, 0
+
 
 # SDK初期化
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
@@ -112,8 +174,75 @@ MENU_ITEMS = [
     {"id": "party", "name": "パーティーコース", "price": 5000, "duration": 150, "emoji": "🎉"},
 ]
 
-# 予約フローのセッション（インメモリ — フロー中のみ使用）
-reservation_sessions = {}
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 予約セッション管理（Supabase永続化）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SESSION_TTL_MINUTES = 30
+
+
+def session_get(uid):
+    """ユーザーの予約セッションを取得。期限切れなら削除してNone。"""
+    try:
+        rows = supabase_get("reservation_sessions", {
+            "select": "*",
+            "line_user_id": f"eq.{uid}",
+        })
+        if not rows:
+            return None
+        row = rows[0]
+        expires = datetime.datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+        if expires < datetime.datetime.now(datetime.timezone.utc):
+            session_delete(uid)
+            return None
+        return row["session_data"]
+    except Exception as e:
+        logger.error(f"session_get error: {e}")
+        return None
+
+
+def session_set(uid, data):
+    """ユーザーの予約セッションを作成または上書き。"""
+    try:
+        expires = (datetime.datetime.now(datetime.timezone.utc)
+                   + datetime.timedelta(minutes=SESSION_TTL_MINUTES)).isoformat()
+        payload = {
+            "line_user_id": uid,
+            "session_data": data,
+            "expires_at": expires,
+        }
+        headers = {**SUPABASE_HEADERS, "Prefer": "return=representation,resolution=merge-duplicates"}
+        url = f"{SUPABASE_URL}/rest/v1/reservation_sessions"
+        res = http_requests.post(url, headers=headers, json=payload)
+        res.raise_for_status()
+    except Exception as e:
+        logger.error(f"session_set error: {e}")
+
+
+def session_update(uid, updates):
+    """既存セッションの一部フィールドを更新。"""
+    current = session_get(uid)
+    if current is None:
+        return None
+    current.update(updates)
+    session_set(uid, current)
+    return current
+
+
+def session_delete(uid):
+    """ユーザーの予約セッションを削除。"""
+    try:
+        supabase_delete("reservation_sessions", {"line_user_id": f"eq.{uid}"})
+    except Exception:
+        pass
+
+
+def cleanup_expired_sessions():
+    """期限切れセッションを一括削除。"""
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        supabase_delete("reservation_sessions", {"expires_at": f"lt.{now}"})
+    except Exception as e:
+        logger.error(f"Session cleanup error: {e}")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -818,6 +947,19 @@ def push_flex(user_id, alt_text, flex_content):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# プライバシーポリシー・利用規約
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@app.route("/privacy")
+def privacy_policy():
+    return render_template("privacy.html", store_name=STORE_NAME, updated_date=datetime.datetime.now(JST).strftime("%Y年%m月%d日"))
+
+
+@app.route("/terms")
+def terms_of_service():
+    return render_template("terms.html", store_name=STORE_NAME, updated_date=datetime.datetime.now(JST).strftime("%Y年%m月%d日"))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Webhookエンドポイント
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @app.route("/callback", methods=["POST"])
@@ -833,7 +975,14 @@ def callback():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return "OK"
+    """ヘルスチェック（Render監視用）— DB接続確認付き"""
+    status = {"app": "ok", "database": "ok"}
+    try:
+        supabase_get("store_settings", {"select": "key", "limit": "1"})
+    except Exception as e:
+        status["database"] = f"error: {str(e)[:100]}"
+        return jsonify(status), 503
+    return jsonify(status), 200
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -851,15 +1000,23 @@ def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
 
-    session = reservation_sessions.get(user_id)
+    session = session_get(user_id)
     if session:
         if session["step"] == "name":
-            session["name"] = text
-            session["step"] = "phone"
+            valid, sanitized_name = validate_name(text)
+            if not valid:
+                reply_text(event.reply_token, "⚠️ お名前を正しく入力してください（50文字以内）")
+                return
+            session_update(user_id, {"name": sanitized_name, "step": "phone"})
             reply_text(event.reply_token, "📱 お電話番号を入力してください（例: 090-1234-5678）")
             return
         elif session["step"] == "phone":
-            session["phone"] = text
+            valid, cleaned_phone = validate_phone(text)
+            if not valid:
+                reply_text(event.reply_token, "⚠️ 電話番号の形式が正しくありません。\n例: 090-1234-5678")
+                return
+            session_update(user_id, {"phone": cleaned_phone or text, "step": "confirm"})
+            session["phone"] = cleaned_phone or text
             session["step"] = "confirm"
             reply_flex(event.reply_token, "予約内容の確認", build_confirm_flex(session))
             return
@@ -867,13 +1024,12 @@ def handle_message(event):
     if text in ["予約", "予約する", "予約したい"]:
         reply_flex(event.reply_token, f"{STORE_NAME} LINE予約", build_welcome_flex())
     elif text in ["メニュー", "コース"]:
-        reservation_sessions[user_id] = {"step": "menu"}
+        session_set(user_id, {"step": "menu"})
         reply_flex(event.reply_token, "メニュー選択", build_menu_flex())
     elif text in ["確認", "予約確認"]:
         handle_check_reservation(event.reply_token, user_id)
     elif text in ["キャンセル", "取消"]:
-        if user_id in reservation_sessions:
-            del reservation_sessions[user_id]
+        session_delete(user_id)
         handle_list_cancel(event.reply_token, user_id)
     else:
         reply_flex(event.reply_token, f"{STORE_NAME} LINE予約", build_welcome_flex())
@@ -886,21 +1042,25 @@ def handle_postback(event):
     action = data.get("action")
 
     if action == "start_reservation":
-        reservation_sessions[user_id] = {"step": "menu", "user_id": user_id}
+        session_set(user_id, {"step": "menu", "user_id": user_id})
         reply_flex(event.reply_token, "メニュー選択", build_menu_flex())
 
     elif action == "select_menu":
-        session = reservation_sessions.get(user_id, {"user_id": user_id})
+        session = session_get(user_id) or {"user_id": user_id}
         session["menu"] = data["menu_id"]
         session["step"] = "guests"
-        reservation_sessions[user_id] = session
+        session_set(user_id, session)
         reply_flex(event.reply_token, "人数選択", build_guests_flex())
 
     elif action == "select_guests":
-        session = reservation_sessions.get(user_id, {})
-        session["guests"] = int(data["guests"])
+        valid, guest_count = validate_positive_int(data.get("guests", 0), max_val=MAX_SEATS)
+        if not valid:
+            reply_text(event.reply_token, "⚠️ 人数が正しくありません。もう一度お試しください。")
+            return
+        session = session_get(user_id) or {}
+        session["guests"] = guest_count
         session["step"] = "date"
-        reservation_sessions[user_id] = session
+        session_set(user_id, session)
         reply_text(event.reply_token, "📅 カレンダーを準備しています...\n少々お待ちください")
         push_flex(user_id, "日付選択", build_date_flex())
 
@@ -908,7 +1068,7 @@ def handle_postback(event):
         reply_text(event.reply_token, "🚫 その日は定休日です。別の日をお選びください。")
 
     elif action == "select_date" or action == "reselect_date":
-        session = reservation_sessions.get(user_id, {})
+        session = session_get(user_id) or {}
 
         if action == "reselect_date":
             reply_flex(event.reply_token, "日付選択", build_date_flex())
@@ -928,7 +1088,7 @@ def handle_postback(event):
 
         session["date"] = selected_date
         session["step"] = "time"
-        reservation_sessions[user_id] = session
+        session_set(user_id, session)
 
         reply_text(event.reply_token, "🔍 空き状況を確認しています...\n少々お待ちください")
         menu = next((m for m in MENU_ITEMS if m["id"] == session.get("menu")), None)
@@ -937,14 +1097,14 @@ def handle_postback(event):
         push_flex(user_id, "時間選択", build_time_flex(slots))
 
     elif action == "select_time":
-        session = reservation_sessions.get(user_id, {})
+        session = session_get(user_id) or {}
         session["time"] = data["time"]
         session["step"] = "name"
-        reservation_sessions[user_id] = session
+        session_set(user_id, session)
         reply_text(event.reply_token, "✏️ ご予約のお名前を入力してください")
 
     elif action == "confirm_reservation":
-        session = reservation_sessions.get(user_id)
+        session = session_get(user_id)
         if not session:
             reply_text(event.reply_token, "セッションが切れました。「予約」と送信してやり直してください。")
             return
@@ -989,11 +1149,10 @@ def handle_postback(event):
         notify_owner(saved)
 
         # セッションクリア
-        del reservation_sessions[user_id]
+        session_delete(user_id)
 
     elif action == "cancel_flow":
-        if user_id in reservation_sessions:
-            del reservation_sessions[user_id]
+        session_delete(user_id)
         reply_text(event.reply_token, "予約フローをキャンセルしました。\n「予約」と送信するとやり直せます。")
 
     elif action == "check_reservation":
@@ -1124,35 +1283,63 @@ def send_reminders():
 
 scheduler = BackgroundScheduler(timezone="Asia/Tokyo")
 scheduler.add_job(send_reminders, "cron", hour=18, minute=0)
+scheduler.add_job(cleanup_expired_sessions, "interval", minutes=10)
 scheduler.start()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # オーナーダッシュボード
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def check_dashboard_auth():
-    """ダッシュボード認証チェック"""
-    token = request.args.get("token") or request.headers.get("X-Dashboard-Token")
-    if not token or token != DASHBOARD_PASSWORD:
-        abort(401)
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ログイン</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,sans-serif;background:#f5f5f5;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login{background:#fff;border-radius:16px;padding:40px 32px;width:90%%;max-width:380px;box-shadow:0 2px 12px rgba(0,0,0,.1);text-align:center}
+.login h1{font-size:20px;margin-bottom:8px;color:#333}
+.login small{color:#888;font-size:13px}
+.login input{width:100%%;padding:12px;border:1px solid #ddd;border-radius:8px;font-size:16px;margin-top:20px}
+.login input:focus{outline:none;border-color:#E05241}
+.login button{width:100%%;padding:12px;background:#E05241;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;margin-top:12px;cursor:pointer}
+.login button:hover{background:#c0392b}
+.error{color:#c62828;font-size:13px;margin-top:12px}
+</style></head><body>
+<div class="login">
+<h1>🍽️ %s</h1><small>オーナーダッシュボード</small>
+<form method="POST"><input type="password" name="password" placeholder="パスワードを入力" autofocus>
+<button type="submit">ログイン</button></form>
+%s</div></body></html>"""
+
+
+@app.route("/dashboard/login", methods=["GET", "POST"])
+def dashboard_login():
+    if request.method == "POST":
+        pw = request.form.get("password", "")
+        if pw and pw == DASHBOARD_PASSWORD:
+            flask_session["dashboard_authenticated"] = True
+            return redirect(url_for("dashboard"))
+        error_html = '<div class="error">パスワードが正しくありません</div>'
+        return LOGIN_PAGE % (STORE_NAME, error_html), 401
+    return LOGIN_PAGE % (STORE_NAME, "")
+
+
+@app.route("/dashboard/logout")
+def dashboard_logout():
+    flask_session.clear()
+    return redirect(url_for("dashboard_login"))
 
 
 @app.route("/dashboard")
-def dashboard_page():
-    """ダッシュボード画面"""
-    check_dashboard_auth()
-    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
-    with open(html_path, encoding="utf-8") as f:
-        html = f.read()
-    html = html.replace("{{ store_name }}", STORE_NAME)
-    html = html.replace("{{ token }}", request.args.get("token", ""))
-    return html
+@dashboard_auth_required
+def dashboard():
+    return render_template("dashboard.html", store_name=STORE_NAME)
 
 
 # --- 予約API ---
 @app.route("/api/reservations")
+@dashboard_auth_required
 def api_get_reservations():
-    check_dashboard_auth()
     date_from = request.args.get("date_from", datetime.datetime.now(JST).strftime("%Y-%m-%d"))
     status_filter = request.args.get("status", "")
     params = {
@@ -1171,8 +1358,8 @@ def api_get_reservations():
 
 
 @app.route("/api/reservations/<int:rid>/cancel", methods=["POST"])
+@dashboard_auth_required
 def api_cancel_reservation(rid):
-    check_dashboard_auth()
     try:
         # カレンダーからも削除
         rows = supabase_get("reservations", {"select": "*", "id": f"eq.{rid}"})
@@ -1203,8 +1390,8 @@ def api_cancel_reservation(rid):
 
 # --- 設定API ---
 @app.route("/api/settings/booking-deadline")
+@dashboard_auth_required
 def api_get_booking_deadline():
-    check_dashboard_auth()
     try:
         hours = get_booking_deadline_hours()
         return jsonify({"value": hours})
@@ -1213,13 +1400,17 @@ def api_get_booking_deadline():
 
 
 @app.route("/api/settings/booking-deadline", methods=["POST"])
+@dashboard_auth_required
 def api_set_booking_deadline():
-    check_dashboard_auth()
     body = request.get_json()
     hours = body.get("hours", 2)
+    valid, hours_int = validate_positive_int(hours, max_val=24)
+    if not valid and hours != 0:
+        return jsonify({"error": "無効な値です（0〜24）"}), 400
+    hours_int = int(hours) if hours == 0 else hours_int
     try:
-        db_set_setting("booking_deadline_hours", int(hours))
-        return jsonify({"success": True, "value": int(hours)})
+        db_set_setting("booking_deadline_hours", hours_int)
+        return jsonify({"success": True, "value": hours_int})
     except Exception as e:
         logger.error(f"API設定更新エラー: {e}")
         return jsonify({"error": str(e)}), 500
@@ -1227,8 +1418,8 @@ def api_set_booking_deadline():
 
 # --- 定休日API ---
 @app.route("/api/closed-days")
+@dashboard_auth_required
 def api_get_closed_days():
-    check_dashboard_auth()
     try:
         rows = supabase_get("closed_days", {"select": "*", "order": "day_of_week.asc,closed_date.asc"})
         return jsonify({"data": rows})
@@ -1238,11 +1429,29 @@ def api_get_closed_days():
 
 
 @app.route("/api/closed-days", methods=["POST"])
+@dashboard_auth_required
 def api_add_closed_day():
-    check_dashboard_auth()
     body = request.get_json()
+    if not body:
+        return jsonify({"error": "リクエストボディが空です"}), 400
+    # サニタイズ
+    safe_body = {}
+    if "day_of_week" in body:
+        valid, dow = validate_positive_int(body["day_of_week"], max_val=6)
+        if body["day_of_week"] == 0:
+            dow = 0
+            valid = True
+        if not valid:
+            return jsonify({"error": "曜日の値が不正です（0〜6）"}), 400
+        safe_body["day_of_week"] = dow
+    if "closed_date" in body:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", str(body["closed_date"])):
+            return jsonify({"error": "日付の形式が不正です（YYYY-MM-DD）"}), 400
+        safe_body["closed_date"] = body["closed_date"]
+    safe_body["reason"] = sanitize_text(body.get("reason", "定休日"), max_length=100)
+    safe_body["is_recurring"] = bool(body.get("is_recurring", False))
     try:
-        res = supabase_post("closed_days", body)
+        res = supabase_post("closed_days", safe_body)
         return jsonify({"data": res})
     except Exception as e:
         logger.error(f"API定休日追加エラー: {e}")
@@ -1250,8 +1459,8 @@ def api_add_closed_day():
 
 
 @app.route("/api/closed-days/<int:cid>", methods=["DELETE"])
+@dashboard_auth_required
 def api_delete_closed_day(cid):
-    check_dashboard_auth()
     try:
         url = f"{SUPABASE_URL}/rest/v1/closed_days"
         res = http_requests.delete(url, headers=SUPABASE_HEADERS, params={"id": f"eq.{cid}"})
@@ -1264,8 +1473,8 @@ def api_delete_closed_day(cid):
 
 # --- 顧客API ---
 @app.route("/api/customers")
+@dashboard_auth_required
 def api_get_customers():
-    check_dashboard_auth()
     try:
         rows = supabase_get("customers", {
             "select": "*",
