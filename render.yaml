@@ -6,10 +6,17 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2
+    healthCheckPath: /health
     envVars:
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
       - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DASHBOARD_PASSWORD
         sync: false
       - key: OWNER_LINE_USER_ID
         sync: false
@@ -17,6 +24,8 @@ services:
         sync: false
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false
+      - key: FLASK_SECRET_KEY
+        generateValue: true
       - key: STORE_NAME
         value: サンプルレストラン
       - key: STORE_OPEN_HOUR
