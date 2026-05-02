@@ -1032,7 +1032,8 @@ def handle_message(event):
         session_delete(user_id)
         handle_list_cancel(event.reply_token, user_id)
     else:
-        reply_flex(event.reply_token, f"{STORE_NAME} LINE予約", build_welcome_flex())
+        #reply_flex(event.reply_token, f"{STORE_NAME} LINE予約", build_welcome_flex())
+        return
 
 
 @handler.add(PostbackEvent)
