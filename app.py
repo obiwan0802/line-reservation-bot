@@ -1313,15 +1313,61 @@ body{font-family:-apple-system,sans-serif;background:#f5f5f5;display:flex;align-
 %s</div></body></html>"""
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# オーナーダッシュボード（セキュリティ強化版：ブルートフォース対策込）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ログイン試行の記録用（メモリ保持のため再起動でリセットされます）
+LOGIN_ATTEMPTS = {}  # 形式: { "ip": {"count": 0, "lock_until": datetime} }
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_DURATION = datetime.timedelta(minutes=15)
+
+def get_client_ip():
+    """Render等のプロキシ環境下で正しい接続元IPを取得"""
+    if request.headers.get('X-Forwarded-For'):
+        # プロキシ経由の場合、一番左のIPがクライアントのIP
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return request.remote_addr
+
 @app.route("/dashboard/login", methods=["GET", "POST"])
 def dashboard_login():
+    ip = get_client_ip()
+    now = datetime.datetime.now(JST)
+
+    # 1. IPごとのロック状態をチェック
+    if ip in LOGIN_ATTEMPTS:
+        lock_until = LOGIN_ATTEMPTS[ip].get("lock_until")
+        if lock_until and now < lock_until:
+            wait_min = int((lock_until - now).total_seconds() / 60) + 1
+            error_html = f'<div class="error">セキュリティロック中：あと{wait_min}分試行できません</div>'
+            return LOGIN_PAGE % (STORE_NAME, error_html), 403
+
     if request.method == "POST":
         pw = request.form.get("password", "")
+        
         if pw and pw == DASHBOARD_PASSWORD:
+            # ログイン成功：当該IPの試行記録をクリア
+            if ip in LOGIN_ATTEMPTS:
+                del LOGIN_ATTEMPTS[ip]
             flask_session["dashboard_authenticated"] = True
             return redirect(url_for("dashboard"))
-        error_html = '<div class="error">パスワードが正しくありません</div>'
+        
+        # ログイン失敗：試行回数を記録
+        if ip not in LOGIN_ATTEMPTS:
+            LOGIN_ATTEMPTS[ip] = {"count": 0, "lock_until": None}
+        
+        LOGIN_ATTEMPTS[ip]["count"] += 1
+        remaining = MAX_LOGIN_ATTEMPTS - LOGIN_ATTEMPTS[ip]["count"]
+
+        if LOGIN_ATTEMPTS[ip]["count"] >= MAX_LOGIN_ATTEMPTS:
+            # 上限に達したためロック時間を設定
+            LOGIN_ATTEMPTS[ip]["lock_until"] = now + LOCKOUT_DURATION
+            error_html = '<div class="error">失敗回数が上限に達しました。15分間ロックされます。</div>'
+            logger.warning(f"🚨 セキュリティ警告：IP {ip} からのログイン試行が上限に達し、ロックされました。")
+        else:
+            error_html = f'<div class="error">パスワードが違います（あと{remaining}回でロック）</div>'
+        
         return LOGIN_PAGE % (STORE_NAME, error_html), 401
+
     return LOGIN_PAGE % (STORE_NAME, "")
 
 
