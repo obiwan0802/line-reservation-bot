@@ -630,7 +630,7 @@ def build_guests_flex():
     rows = []
     for i in range(0, len(buttons), 2):
         rows.append({"type": "box", "layout": "horizontal",
-                    "contents": buttons[i:i+2], "spacing": "md",
+                      "contents": buttons[i:i+2], "spacing": "md",
                       "margin": "md"})
     return {
         "type": "bubble",
@@ -649,8 +649,8 @@ def build_guests_flex():
     }
 
 
-def build_date_flex():
-    """カレンダー型の日付選択（3ヶ月分カルーセル）"""
+def build_date_flex(month_offset=0):
+    """カレンダー型の日付選択（1ヶ月表示＋前月/翌月ボタン）"""
     today = datetime.datetime.now(JST)
     today_date = today.date()
 
@@ -674,97 +674,138 @@ def build_date_flex():
         return d.strftime("%Y-%m-%d") in specific_dates
 
     weekday_labels = ["月", "火", "水", "木", "金", "土", "日"]
-    bubbles = []
 
-    for month_offset in range(3):
-        year = today.year
-        month = today.month + month_offset
-        while month > 12:
-            year += 1
-            month -= 12
+    year = today.year
+    month = today.month + month_offset
+    while month > 12:
+        year += 1
+        month -= 12
 
-        weeks = cal_module.monthcalendar(year, month)
+    weeks = cal_module.monthcalendar(year, month)
 
-        # 曜日ヘッダー
-        header_row = {
-            "type": "box", "layout": "horizontal", "margin": "md",
-            "contents": [
-                {"type": "text", "text": wd, "size": "xxs", "align": "center", "flex": 1,
-                 "color": "#E05241" if i == 6 else "#1565c0" if i == 5 else "#888888"}
-                for i, wd in enumerate(weekday_labels)
-            ],
-        }
-
-        rows = [
-            {"type": "text", "text": f"{year}年{month}月", "weight": "bold",
-             "size": "md", "align": "center"},
-            {"type": "separator", "margin": "sm"},
-            header_row,
-        ]
-
-        for week in weeks:
-            row_contents = []
-            for i, day in enumerate(week):
-                if day == 0:
-                    row_contents.append({
-                        "type": "box", "layout": "vertical", "flex": 1,
-                        "contents": [{"type": "text", "text": " ", "size": "sm", "align": "center"}],
-                    })
-                else:
-                    d = datetime.date(year, month, day)
-                    date_str = d.strftime("%Y-%m-%d")
-                    is_past = d < today_date
-                    closed = is_closed(d)
-
-                    if is_past:
-                        row_contents.append({
-                            "type": "box", "layout": "vertical", "flex": 1,
-                            "contents": [{"type": "text", "text": str(day), "size": "sm",
-                                          "align": "center", "color": "#DDDDDD"}],
-                        })
-                    elif closed:
-                        row_contents.append({
-                            "type": "box", "layout": "vertical", "flex": 1,
-                            "action": {"type": "postback", "label": "定休日",
-                                       "data": "action=closed_day"},
-                            "contents": [{"type": "text", "text": str(day), "size": "sm",
-                                          "align": "center", "color": "#CCCCCC",
-                                          "decoration": "line-through"}],
-                        })
-                    elif d == today_date:
-                        row_contents.append({
-                            "type": "box", "layout": "vertical", "flex": 1,
-                            "action": {"type": "postback", "label": str(day),
-                                       "data": f"action=select_date&date={date_str}"},
-                            "contents": [{"type": "text", "text": str(day), "size": "sm",
-                                          "align": "center", "color": "#FFFFFF",
-                                          "weight": "bold"}],
-                            "backgroundColor": "#E05241", "cornerRadius": "14px",
-                        })
-                    else:
-                        color = "#E05241" if i == 6 else "#1565c0" if i == 5 else "#333333"
-                        row_contents.append({
-                            "type": "box", "layout": "vertical", "flex": 1,
-                            "action": {"type": "postback", "label": str(day),
-                                       "data": f"action=select_date&date={date_str}"},
-                            "contents": [{"type": "text", "text": str(day), "size": "sm",
-                                          "align": "center", "color": color}],
-                        })
-
-            rows.append({
-                "type": "box", "layout": "horizontal",
-                "contents": row_contents, "margin": "sm",
-            })
-
-        bubbles.append({
-            "type": "bubble", "size": "kilo",
-            "body": {
-                "type": "box", "layout": "vertical",
-                "contents": rows, "paddingAll": "12px",
-            },
+    # ── ナビゲーションヘッダー（◀ 2026年5月 ▶）──
+    nav_contents = []
+    if month_offset > 0:
+        nav_contents.append({
+            "type": "box", "layout": "vertical", "flex": 1,
+            "action": {"type": "postback", "label": "前月",
+                       "data": f"action=calendar_nav&offset={month_offset - 1}"},
+            "contents": [{"type": "text", "text": "◀", "size": "xl",
+                          "align": "center", "color": "#E05241"}],
+            "justifyContent": "center", "alignItems": "center",
+        })
+    else:
+        nav_contents.append({
+            "type": "box", "layout": "vertical", "flex": 1,
+            "contents": [{"type": "text", "text": " ", "size": "xl", "align": "center"}],
         })
 
-    return {"type": "carousel", "contents": bubbles}
+    nav_contents.append({
+        "type": "text", "text": f"{year}年{month}月", "weight": "bold",
+        "size": "xl", "align": "center", "flex": 3,
+    })
+
+    if month_offset < 2:
+        nav_contents.append({
+            "type": "box", "layout": "vertical", "flex": 1,
+            "action": {"type": "postback", "label": "翌月",
+                       "data": f"action=calendar_nav&offset={month_offset + 1}"},
+            "contents": [{"type": "text", "text": "▶", "size": "xl",
+                          "align": "center", "color": "#E05241"}],
+            "justifyContent": "center", "alignItems": "center",
+        })
+    else:
+        nav_contents.append({
+            "type": "box", "layout": "vertical", "flex": 1,
+            "contents": [{"type": "text", "text": " ", "size": "xl", "align": "center"}],
+        })
+
+    nav_row = {
+        "type": "box", "layout": "horizontal",
+        "contents": nav_contents, "alignItems": "center",
+        "paddingBottom": "md",
+    }
+
+    # ── 曜日ヘッダー ──
+    header_row = {
+        "type": "box", "layout": "horizontal", "margin": "md",
+        "contents": [
+            {"type": "text", "text": wd, "size": "sm", "align": "center", "flex": 1,
+             "weight": "bold",
+             "color": "#E05241" if i == 6 else "#1565c0" if i == 5 else "#888888"}
+            for i, wd in enumerate(weekday_labels)
+        ],
+    }
+
+    rows = [nav_row, {"type": "separator", "margin": "sm"}, header_row]
+
+    # ── 日付セル ──
+    for week in weeks:
+        row_contents = []
+        for i, day in enumerate(week):
+            if day == 0:
+                row_contents.append({
+                    "type": "box", "layout": "vertical", "flex": 1,
+                    "height": "40px", "justifyContent": "center",
+                    "contents": [{"type": "text", "text": " ", "size": "md", "align": "center"}],
+                })
+            else:
+                d = datetime.date(year, month, day)
+                date_str = d.strftime("%Y-%m-%d")
+                is_past = d < today_date
+                closed = is_closed(d)
+
+                if is_past:
+                    row_contents.append({
+                        "type": "box", "layout": "vertical", "flex": 1,
+                        "height": "40px", "justifyContent": "center",
+                        "contents": [{"type": "text", "text": str(day), "size": "md",
+                                      "align": "center", "color": "#DDDDDD"}],
+                    })
+                elif closed:
+                    row_contents.append({
+                        "type": "box", "layout": "vertical", "flex": 1,
+                        "height": "40px", "justifyContent": "center",
+                        "action": {"type": "postback", "label": "定休日",
+                                   "data": "action=closed_day"},
+                        "contents": [{"type": "text", "text": str(day), "size": "md",
+                                      "align": "center", "color": "#CCCCCC",
+                                      "decoration": "line-through"}],
+                    })
+                elif d == today_date:
+                    row_contents.append({
+                        "type": "box", "layout": "vertical", "flex": 1,
+                        "height": "40px", "justifyContent": "center",
+                        "action": {"type": "postback", "label": str(day),
+                                   "data": f"action=select_date&date={date_str}"},
+                        "contents": [{"type": "text", "text": str(day), "size": "md",
+                                      "align": "center", "color": "#FFFFFF",
+                                      "weight": "bold"}],
+                        "backgroundColor": "#E05241", "cornerRadius": "20px",
+                    })
+                else:
+                    color = "#E05241" if i == 6 else "#1565c0" if i == 5 else "#333333"
+                    row_contents.append({
+                        "type": "box", "layout": "vertical", "flex": 1,
+                        "height": "40px", "justifyContent": "center",
+                        "action": {"type": "postback", "label": str(day),
+                                   "data": f"action=select_date&date={date_str}"},
+                        "contents": [{"type": "text", "text": str(day), "size": "md",
+                                      "align": "center", "color": color}],
+                    })
+
+        rows.append({
+            "type": "box", "layout": "horizontal",
+            "contents": row_contents, "margin": "md",
+        })
+
+    return {
+        "type": "bubble", "size": "giga",
+        "body": {
+            "type": "box", "layout": "vertical",
+            "contents": rows, "paddingAll": "xl",
+        },
+    }
 
 
 def build_time_flex(available_slots):
@@ -1067,6 +1108,10 @@ def handle_postback(event):
         session_set(user_id, session)
         reply_text(event.reply_token, "📅 カレンダーを準備しています...\n少々お待ちください")
         push_flex(user_id, "日付選択", build_date_flex())
+
+    elif action == "calendar_nav":
+        offset = int(data.get("offset", 0))
+        reply_flex(event.reply_token, "日付選択", build_date_flex(month_offset=offset))
 
     elif action == "closed_day":
         reply_text(event.reply_token, "🚫 その日は定休日です。別の日をお選びください。")
