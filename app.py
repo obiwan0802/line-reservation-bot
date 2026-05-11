@@ -630,11 +630,14 @@ def build_guests_flex():
     rows = []
     for i in range(0, len(buttons), 2):
         rows.append({"type": "box", "layout": "horizontal",
-                      "contents": buttons[i:i+2], "spacing": "sm"})
+                    "contents": buttons[i:i+2], "spacing": "md",
+                      "margin": "md"})
     return {
         "type": "bubble",
         "body": {
             "type": "box", "layout": "vertical",
+            "paddingAll": "xl",
+            "spacing": "sm",
             "contents": [
                 {"type": "text", "text": "👥 人数を選択", "weight": "bold", "size": "lg"},
                 {"type": "text", "text": "ご来店人数をお選びください",
