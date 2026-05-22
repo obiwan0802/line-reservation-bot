@@ -267,6 +267,9 @@ def db_get_or_create_customer(line_user_id, display_name=None):
 def db_save_reservation(reservation_data):
     """予約をDBに保存"""
     try:
+        # source未指定ならlineをデフォルト
+        if "source" not in reservation_data:
+            reservation_data["source"] = "line"
         res = supabase_post("reservations", reservation_data)
         return res[0] if res else None
     except Exception as e:
@@ -416,14 +419,20 @@ def create_calendar_event(reservation):
     ).replace(tzinfo=JST)
     end_dt = start_dt + datetime.timedelta(minutes=reservation["duration_minutes"])
 
+    source = reservation.get("source", "line")
+    source_label = "📞電話" if source == "phone" else "LINE"
+    memo_text = f"\nメモ: {reservation['memo']}" if reservation.get("memo") else ""
+
     event = {
-        "summary": f"【予約】{reservation['guest_name']} {reservation['guests']}名",
+        "summary": f"【{source_label}予約】{reservation['guest_name']} {reservation['guests']}名",
         "description": (
+            f"予約経路: {source_label}\n"
             f"コース: {reservation['menu_name']}\n"
             f"人数: {reservation['guests']}名\n"
             f"お名前: {reservation['guest_name']}\n"
             f"電話番号: {reservation.get('phone', '未設定')}\n"
             f"予約金額: ¥{reservation.get('total_price', 0):,}"
+            f"{memo_text}"
         ),
         "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Tokyo"},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": "Asia/Tokyo"},
@@ -1065,6 +1074,120 @@ def handle_message(event):
             reply_flex(event.reply_token, "予約内容の確認", build_confirm_flex(session))
             return
 
+    # --- オーナー用: 電話予約クイック登録 ---
+    if user_id == OWNER_LINE_USER_ID and text in ["電話予約", "電話予約登録"]:
+        session_set(user_id, {"step": "phone_reg_name", "user_id": user_id, "is_phone_reg": True})
+        reply_text(event.reply_token, "📞 電話予約登録モード\n\nお客様のお名前を入力してください")
+        return
+
+    if session and session.get("is_phone_reg"):
+        step = session["step"]
+        if step == "phone_reg_name":
+            valid, sanitized_name = validate_name(text)
+            if not valid:
+                reply_text(event.reply_token, "⚠️ お名前を正しく入力してください（50文字以内）")
+                return
+            session_update(user_id, {"phone_reg_name": sanitized_name, "step": "phone_reg_guests"})
+            reply_text(event.reply_token, f"👤 {sanitized_name} 様\n\n👥 人数を入力してください（例: 3）")
+            return
+        elif step == "phone_reg_guests":
+            valid, guest_count = validate_positive_int(text, max_val=MAX_SEATS)
+            if not valid:
+                reply_text(event.reply_token, f"⚠️ 1〜{MAX_SEATS}の数字を入力してください")
+                return
+            session_update(user_id, {"phone_reg_guests": guest_count, "step": "phone_reg_date"})
+            reply_text(event.reply_token, f"👥 {guest_count}名\n\n📅 日付を入力してください（例: 5/25 または 2026-05-25）")
+            return
+        elif step == "phone_reg_date":
+            # 柔軟な日付パース
+            date_str = None
+            today = datetime.datetime.now(JST)
+            text_clean = text.strip()
+            # YYYY-MM-DD形式
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", text_clean):
+                date_str = text_clean
+            # M/D形式
+            elif re.match(r"^\d{1,2}/\d{1,2}$", text_clean):
+                parts = text_clean.split("/")
+                m, d = int(parts[0]), int(parts[1])
+                year = today.year
+                candidate = datetime.date(year, m, d)
+                if candidate < today.date():
+                    candidate = datetime.date(year + 1, m, d)
+                date_str = candidate.strftime("%Y-%m-%d")
+            if not date_str:
+                reply_text(event.reply_token, "⚠️ 日付の形式が正しくありません\n例: 5/25 または 2026-05-25")
+                return
+            if db_is_closed_day(date_str):
+                reply_text(event.reply_token, "🚫 その日は定休日です。別の日を入力してください。")
+                return
+            session_update(user_id, {"phone_reg_date": date_str, "step": "phone_reg_time"})
+            reply_text(event.reply_token, f"📅 {date_str}\n\n🕐 時間を入力してください（例: 18:30）")
+            return
+        elif step == "phone_reg_time":
+            time_match = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
+            if not time_match:
+                reply_text(event.reply_token, "⚠️ 時間の形式が正しくありません\n例: 18:30")
+                return
+            h, m = int(time_match.group(1)), int(time_match.group(2))
+            if h < 0 or h > 23 or m < 0 or m > 59:
+                reply_text(event.reply_token, "⚠️ 正しい時刻を入力してください")
+                return
+            time_str = f"{h:02d}:{m:02d}"
+            session_update(user_id, {"phone_reg_time": time_str, "step": "phone_reg_phone"})
+            reply_text(event.reply_token, f"🕐 {time_str}\n\n📱 お客様の電話番号を入力（不明なら「なし」と入力）")
+            return
+        elif step == "phone_reg_phone":
+            phone = ""
+            if text.strip() not in ["なし", "ナシ", "無し", "不明", "-", "ー"]:
+                valid, cleaned = validate_phone(text)
+                if not valid:
+                    reply_text(event.reply_token, "⚠️ 電話番号の形式が正しくありません\n不明なら「なし」と入力してください")
+                    return
+                phone = cleaned or text.strip()
+            session_update(user_id, {"phone_reg_phone": phone, "step": "phone_reg_memo"})
+            reply_text(event.reply_token, "📝 メモがあれば入力（なければ「なし」）\n例: 窓際希望、アレルギーあり")
+            return
+        elif step == "phone_reg_memo":
+            memo = "" if text.strip() in ["なし", "ナシ", "無し", "-", "ー"] else sanitize_text(text, max_length=200)
+            session = session_get(user_id)
+            # 予約確定
+            menu = MENU_ITEMS[0]  # 電話予約はデフォルト「席のみ」
+            reservation_data = {
+                "line_user_id": "phone_reservation",
+                "guest_name": session.get("phone_reg_name", ""),
+                "phone": session.get("phone_reg_phone", ""),
+                "menu_id": menu["id"],
+                "menu_name": menu["name"],
+                "guests": session.get("phone_reg_guests", 1),
+                "reservation_date": session.get("phone_reg_date", ""),
+                "reservation_time": session.get("phone_reg_time", ""),
+                "duration_minutes": menu["duration"],
+                "total_price": 0,
+                "status": "confirmed",
+                "source": "phone",
+                "memo": memo,
+            }
+            cal_event_id = create_calendar_event(reservation_data)
+            reservation_data["calendar_event_id"] = cal_event_id
+            saved = db_save_reservation(reservation_data)
+            session_delete(user_id)
+            if saved:
+                d = datetime.datetime.strptime(reservation_data["reservation_date"], "%Y-%m-%d")
+                wd = ["月","火","水","木","金","土","日"][d.weekday()]
+                memo_line = f"\n📝 {memo}" if memo else ""
+                reply_text(event.reply_token,
+                    f"✅ 電話予約を登録しました！\n\n"
+                    f"👤 {reservation_data['guest_name']} 様\n"
+                    f"📅 {d.month}/{d.day}（{wd}） {reservation_data['reservation_time']}〜\n"
+                    f"👥 {reservation_data['guests']}名\n"
+                    f"📱 {reservation_data.get('phone') or '未設定'}"
+                    f"{memo_line}\n\n"
+                    f"🔖 予約番号: #{saved['id']}")
+            else:
+                reply_text(event.reply_token, "❌ 予約の保存に失敗しました。もう一度お試しください。")
+            return
+
     if text in ["予約", "予約する", "予約したい"]:
         reply_flex(event.reply_token, f"{STORE_NAME} LINE予約", build_welcome_flex())
     elif text in ["メニュー", "コース"]:
@@ -1287,8 +1410,12 @@ def notify_owner(reservation):
         return
     date_obj = datetime.datetime.strptime(reservation["reservation_date"], "%Y-%m-%d")
     weekday_jp = ["月", "火", "水", "木", "金", "土", "日"]
+    source = reservation.get("source", "line")
+    source_label = "📞電話予約" if source == "phone" else "📱LINE予約"
+    memo_line = f"\n📝 {reservation['memo']}" if reservation.get("memo") else ""
     message = (
         f"🔔 新しい予約が入りました！\n\n"
+        f"🏷️ {source_label}\n"
         f"📅 {date_obj.month}/{date_obj.day}（{weekday_jp[date_obj.weekday()]}）"
         f"{reservation['reservation_time']}〜\n"
         f"👤 {reservation['guest_name']} 様\n"
@@ -1297,6 +1424,7 @@ def notify_owner(reservation):
         f"📱 {reservation.get('phone', '未設定')}\n"
         f"💰 ¥{reservation.get('total_price', 0):,}\n"
         f"🔖 予約番号: #{reservation['id']}"
+        f"{memo_line}"
     )
     try:
         push_text(OWNER_LINE_USER_ID, message)
@@ -1361,9 +1489,422 @@ body{font-family:-apple-system,sans-serif;background:#f5f5f5;display:flex;align-
 %s</div></body></html>"""
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# オーナーダッシュボード（セキュリティ強化版：ブルートフォース対策込）
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="ja"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{STORE_NAME}} - ダッシュボード</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333}
+.header{background:{{BRAND_COLOR}};color:#fff;padding:16px 20px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}
+.header h1{font-size:18px}
+.header a{color:#fff;text-decoration:none;font-size:13px;opacity:.8}
+.tabs{display:flex;background:#fff;border-bottom:1px solid #e0e0e0;overflow-x:auto}
+.tab{padding:12px 20px;font-size:14px;font-weight:600;cursor:pointer;border-bottom:3px solid transparent;white-space:nowrap;color:#666}
+.tab.active{color:{{BRAND_COLOR}};border-bottom-color:{{BRAND_COLOR}}}
+.panel{display:none;padding:16px;max-width:960px;margin:0 auto}
+.panel.active{display:block}
+.card{background:#fff;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.card h3{font-size:15px;margin-bottom:12px;color:#333}
+.form-row{display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.form-group{display:flex;flex-direction:column;flex:1;min-width:140px}
+.form-group label{font-size:12px;font-weight:600;color:#666;margin-bottom:4px}
+.form-group input,.form-group select,.form-group textarea{padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{outline:none;border-color:{{BRAND_COLOR}}}
+.btn{padding:12px 24px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:opacity .2s}
+.btn-primary{background:{{BRAND_COLOR}};color:#fff}
+.btn-primary:hover{opacity:.85}
+.btn-secondary{background:#e0e0e0;color:#333}
+.btn-danger{background:#e74c3c;color:#fff}
+.btn-sm{padding:6px 12px;font-size:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:#f8f8f8;padding:10px 8px;text-align:left;font-weight:600;color:#666;border-bottom:2px solid #e0e0e0;white-space:nowrap}
+td{padding:10px 8px;border-bottom:1px solid #f0f0f0;vertical-align:top}
+tr:hover{background:#fafafa}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.badge-line{background:#06c755;color:#fff}
+.badge-phone{background:#e74c3c;color:#fff}
+.badge-walk{background:#f39c12;color:#fff}
+.badge-confirmed{background:#27ae60;color:#fff}
+.badge-cancelled{background:#95a5a6;color:#fff}
+.toast{position:fixed;bottom:20px;right:20px;padding:12px 20px;border-radius:8px;color:#fff;font-size:14px;z-index:999;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1}
+.toast-success{background:#27ae60}
+.toast-error{background:#e74c3c}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:#fff;border-radius:10px;padding:16px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.stat .num{font-size:28px;font-weight:700;color:{{BRAND_COLOR}}}
+.stat .label{font-size:12px;color:#888;margin-top:4px}
+.empty{text-align:center;padding:40px;color:#999;font-size:14px}
+@media(max-width:600px){
+  .form-row{flex-direction:column;gap:8px}
+  .form-group{min-width:100%}
+  table{font-size:12px}
+  th,td{padding:8px 4px}
+}
+</style>
+</head><body>
+<div class="header">
+  <h1>🍽️ {{STORE_NAME}}</h1>
+  <a href="/dashboard/logout">ログアウト</a>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('reservations')">📋 予約一覧</div>
+  <div class="tab" onclick="switchTab('phone')">📞 電話予約登録</div>
+  <div class="tab" onclick="switchTab('closed')">🚫 定休日</div>
+  <div class="tab" onclick="switchTab('customers')">👥 顧客</div>
+  <div class="tab" onclick="switchTab('settings')">⚙️ 設定</div>
+</div>
+
+<!-- ===== 予約一覧 ===== -->
+<div id="panel-reservations" class="panel active">
+  <div class="stat-grid" id="stats"></div>
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+      <h3 style="margin:0">予約一覧</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <select id="filter-status" onchange="loadReservations()" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px">
+          <option value="">全ステータス</option>
+          <option value="confirmed" selected>確定のみ</option>
+          <option value="cancelled">キャンセル</option>
+        </select>
+        <select id="filter-source" onchange="filterBySource()" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px">
+          <option value="">全経路</option>
+          <option value="line">LINE</option>
+          <option value="phone">電話</option>
+        </select>
+        <input type="date" id="filter-date" onchange="loadReservations()" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px">
+      </div>
+    </div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr>
+          <th>経路</th><th>日付</th><th>時間</th><th>お名前</th><th>人数</th><th>コース</th><th>電話番号</th><th>メモ</th><th>状態</th><th>操作</th>
+        </tr></thead>
+        <tbody id="reservation-table"></tbody>
+      </table>
+    </div>
+    <div id="reservation-empty" class="empty" style="display:none">予約がありません</div>
+  </div>
+</div>
+
+<!-- ===== 電話予約登録 ===== -->
+<div id="panel-phone" class="panel">
+  <div class="card">
+    <h3>📞 電話予約を登録</h3>
+    <p style="font-size:13px;color:#888;margin-bottom:16px">電話で受けた予約をここから登録します。空き状況は自動チェックされます。</p>
+    <form id="phone-form" onsubmit="submitPhoneReservation(event)">
+      <div class="form-row">
+        <div class="form-group">
+          <label>日付 *</label>
+          <input type="date" id="ph-date" required>
+        </div>
+        <div class="form-group">
+          <label>時間 *</label>
+          <input type="time" id="ph-time" required>
+        </div>
+        <div class="form-group">
+          <label>人数 *</label>
+          <input type="number" id="ph-guests" min="1" max="99" value="2" required>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>お名前 *</label>
+          <input type="text" id="ph-name" placeholder="山田太郎" required maxlength="50">
+        </div>
+        <div class="form-group">
+          <label>電話番号</label>
+          <input type="tel" id="ph-phone" placeholder="090-1234-5678">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>コース</label>
+          <select id="ph-menu"></select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group" style="flex:1 1 100%">
+          <label>メモ（アレルギー・席希望など）</label>
+          <textarea id="ph-memo" rows="2" maxlength="200" placeholder="例：窓際希望、卵アレルギーあり"></textarea>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary" id="ph-submit">📞 電話予約を登録</button>
+    </form>
+  </div>
+</div>
+
+<!-- ===== 定休日 ===== -->
+<div id="panel-closed" class="panel">
+  <div class="card">
+    <h3>定休日設定</h3>
+    <div class="form-row" style="margin-bottom:16px">
+      <div class="form-group">
+        <label>曜日定休</label>
+        <select id="closed-dow">
+          <option value="">選択</option>
+          <option value="0">月曜</option><option value="1">火曜</option><option value="2">水曜</option>
+          <option value="3">木曜</option><option value="4">金曜</option><option value="5">土曜</option><option value="6">日曜</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>臨時休業日</label>
+        <input type="date" id="closed-date">
+      </div>
+      <div class="form-group">
+        <label>理由</label>
+        <input type="text" id="closed-reason" placeholder="定休日" maxlength="100">
+      </div>
+      <div class="form-group" style="justify-content:flex-end">
+        <label>&nbsp;</label>
+        <button class="btn btn-primary" onclick="addClosedDay()">追加</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>種別</th><th>曜日/日付</th><th>理由</th><th>操作</th></tr></thead>
+      <tbody id="closed-table"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ===== 顧客 ===== -->
+<div id="panel-customers" class="panel">
+  <div class="card">
+    <h3>顧客リスト</h3>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>名前</th><th>電話番号</th><th>来店回数</th><th>登録日</th></tr></thead>
+        <tbody id="customer-table"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 設定 ===== -->
+<div id="panel-settings" class="panel">
+  <div class="card">
+    <h3>予約締切時間</h3>
+    <p style="font-size:13px;color:#888;margin-bottom:12px">予約可能な最短時間（現在時刻から何時間前まで受付か）</p>
+    <div class="form-row">
+      <div class="form-group" style="max-width:200px">
+        <input type="number" id="deadline-hours" min="0" max="24" value="2">
+      </div>
+      <div class="form-group" style="justify-content:flex-end">
+        <button class="btn btn-primary" onclick="saveDeadline()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const MENUS = %MENU_JSON%;
+const DOW_NAMES = ['月','火','水','木','金','土','日'];
+let allReservations = [];
+
+// --- タブ切り替え ---
+function switchTab(name) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  event.target.classList.add('active');
+  if (name === 'reservations') loadReservations();
+  if (name === 'closed') loadClosedDays();
+  if (name === 'customers') loadCustomers();
+  if (name === 'settings') loadDeadline();
+}
+
+// --- Toast通知 ---
+function toast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast toast-' + type + ' show';
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// --- API通信 ---
+async function api(url, opts) {
+  const res = await fetch(url, {headers: {'Content-Type': 'application/json'}, ...opts});
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'エラーが発生しました');
+  return data;
+}
+
+// --- 予約一覧 ---
+async function loadReservations() {
+  const dateFrom = document.getElementById('filter-date').value || new Date().toISOString().split('T')[0];
+  const status = document.getElementById('filter-status').value;
+  let url = '/api/reservations?date_from=' + dateFrom;
+  if (status) url += '&status=' + status;
+  try {
+    const res = await api(url);
+    allReservations = res.data || [];
+    filterBySource();
+    updateStats(allReservations);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function filterBySource() {
+  const source = document.getElementById('filter-source').value;
+  let filtered = allReservations;
+  if (source) filtered = allReservations.filter(r => (r.source || 'line') === source);
+  renderReservations(filtered);
+}
+
+function renderReservations(data) {
+  const tbody = document.getElementById('reservation-table');
+  const empty = document.getElementById('reservation-empty');
+  if (!data.length) { tbody.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  tbody.innerHTML = data.map(r => {
+    const src = r.source || 'line';
+    const srcBadge = src === 'phone' ? '<span class="badge badge-phone">電話</span>'
+                   : src === 'walk_in' ? '<span class="badge badge-walk">直接</span>'
+                   : '<span class="badge badge-line">LINE</span>';
+    const statusBadge = r.status === 'confirmed' ? '<span class="badge badge-confirmed">確定</span>'
+                      : '<span class="badge badge-cancelled">取消</span>';
+    const d = new Date(r.reservation_date + 'T00:00:00');
+    const dateStr = (d.getMonth()+1) + '/' + d.getDate() + '(' + DOW_NAMES[d.getDay() === 0 ? 6 : d.getDay()-1] + ')';
+    const actions = r.status === 'confirmed'
+      ? '<button class="btn btn-danger btn-sm" onclick="cancelRes(' + r.id + ')">取消</button>'
+      : '';
+    return '<tr><td>' + srcBadge + '</td><td>' + dateStr + '</td><td>' + r.reservation_time + '</td>'
+      + '<td>' + (r.guest_name||'') + '</td><td>' + r.guests + '名</td><td>' + (r.menu_name||'') + '</td>'
+      + '<td>' + (r.phone||'-') + '</td><td style="max-width:120px;overflow:hidden;text-overflow:ellipsis">' + (r.memo||'-') + '</td>'
+      + '<td>' + statusBadge + '</td><td>' + actions + '</td></tr>';
+  }).join('');
+}
+
+function updateStats(data) {
+  const confirmed = data.filter(r => r.status === 'confirmed');
+  const today = new Date().toISOString().split('T')[0];
+  const todayCount = confirmed.filter(r => r.reservation_date === today).length;
+  const todayGuests = confirmed.filter(r => r.reservation_date === today).reduce((s,r) => s + r.guests, 0);
+  const phoneCount = confirmed.filter(r => r.source === 'phone').length;
+  const lineCount = confirmed.filter(r => (r.source||'line') === 'line').length;
+  document.getElementById('stats').innerHTML =
+    '<div class="stat"><div class="num">' + todayCount + '</div><div class="label">本日の予約</div></div>'
+    + '<div class="stat"><div class="num">' + todayGuests + '</div><div class="label">本日の来店人数</div></div>'
+    + '<div class="stat"><div class="num">' + lineCount + '</div><div class="label">LINE予約</div></div>'
+    + '<div class="stat"><div class="num">' + phoneCount + '</div><div class="label">電話予約</div></div>';
+}
+
+async function cancelRes(rid) {
+  if (!confirm('この予約をキャンセルしますか？')) return;
+  try {
+    await api('/api/reservations/' + rid + '/cancel', {method:'POST'});
+    toast('予約をキャンセルしました', 'success');
+    loadReservations();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- 電話予約登録 ---
+function initPhoneForm() {
+  const sel = document.getElementById('ph-menu');
+  sel.innerHTML = MENUS.map(m => '<option value="' + m.id + '">' + m.emoji + ' ' + m.name + ' (¥' + m.price.toLocaleString() + ')</option>').join('');
+  document.getElementById('ph-date').value = new Date().toISOString().split('T')[0];
+}
+
+async function submitPhoneReservation(e) {
+  e.preventDefault();
+  const btn = document.getElementById('ph-submit');
+  btn.disabled = true; btn.textContent = '登録中...';
+  const time = document.getElementById('ph-time').value;
+  const body = {
+    reservation_date: document.getElementById('ph-date').value,
+    reservation_time: time.length === 5 ? time : time.slice(0,5),
+    guests: parseInt(document.getElementById('ph-guests').value),
+    guest_name: document.getElementById('ph-name').value,
+    phone: document.getElementById('ph-phone').value,
+    menu_id: document.getElementById('ph-menu').value,
+    memo: document.getElementById('ph-memo').value,
+  };
+  try {
+    await api('/api/reservations/phone', {method:'POST', body:JSON.stringify(body)});
+    toast('電話予約を登録しました！', 'success');
+    document.getElementById('phone-form').reset();
+    document.getElementById('ph-date').value = new Date().toISOString().split('T')[0];
+    document.getElementById('ph-guests').value = 2;
+  } catch(e) { toast(e.message, 'error'); }
+  btn.disabled = false; btn.textContent = '📞 電話予約を登録';
+}
+
+// --- 定休日 ---
+async function loadClosedDays() {
+  try {
+    const res = await api('/api/closed-days');
+    const tbody = document.getElementById('closed-table');
+    tbody.innerHTML = (res.data||[]).map(c => {
+      const type = c.is_recurring ? '毎週' : '臨時';
+      const detail = c.day_of_week !== null ? DOW_NAMES[c.day_of_week] + '曜日' : c.closed_date || '-';
+      return '<tr><td>' + type + '</td><td>' + detail + '</td><td>' + (c.reason||'') + '</td>'
+        + '<td><button class="btn btn-danger btn-sm" onclick="deleteClosedDay(' + c.id + ')">削除</button></td></tr>';
+    }).join('');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function addClosedDay() {
+  const dow = document.getElementById('closed-dow').value;
+  const date = document.getElementById('closed-date').value;
+  const reason = document.getElementById('closed-reason').value || '定休日';
+  const body = {reason};
+  if (dow !== '') { body.day_of_week = parseInt(dow); body.is_recurring = true; }
+  else if (date) { body.closed_date = date; body.is_recurring = false; }
+  else { toast('曜日または日付を選択してください', 'error'); return; }
+  try {
+    await api('/api/closed-days', {method:'POST', body:JSON.stringify(body)});
+    toast('定休日を追加しました', 'success');
+    loadClosedDays();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function deleteClosedDay(cid) {
+  if (!confirm('削除しますか？')) return;
+  try {
+    await api('/api/closed-days/' + cid, {method:'DELETE'});
+    toast('削除しました', 'success');
+    loadClosedDays();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- 顧客 ---
+async function loadCustomers() {
+  try {
+    const res = await api('/api/customers');
+    const tbody = document.getElementById('customer-table');
+    tbody.innerHTML = (res.data||[]).map(c => {
+      const created = c.created_at ? new Date(c.created_at).toLocaleDateString('ja-JP') : '-';
+      return '<tr><td>' + (c.display_name||'-') + '</td><td>' + (c.phone||'-') + '</td>'
+        + '<td>' + (c.visit_count||0) + '回</td><td>' + created + '</td></tr>';
+    }).join('');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- 設定 ---
+async function loadDeadline() {
+  try {
+    const res = await api('/api/settings/booking-deadline');
+    document.getElementById('deadline-hours').value = res.value || 2;
+  } catch(e) {}
+}
+
+async function saveDeadline() {
+  const hours = parseInt(document.getElementById('deadline-hours').value);
+  try {
+    await api('/api/settings/booking-deadline', {method:'POST', body:JSON.stringify({hours})});
+    toast('保存しました', 'success');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// --- 初期化 ---
+document.getElementById('filter-date').value = new Date().toISOString().split('T')[0];
+initPhoneForm();
+loadReservations();
+</script>
+</body></html>"""
 # ログイン試行の記録用（メモリ保持のため再起動でリセットされます）
 LOGIN_ATTEMPTS = {}  # 形式: { "ip": {"count": 0, "lock_until": datetime} }
 MAX_LOGIN_ATTEMPTS = 5
@@ -1428,7 +1969,9 @@ def dashboard_logout():
 @app.route("/dashboard")
 @dashboard_auth_required
 def dashboard():
-    return render_template("dashboard.html", store_name=STORE_NAME)
+    menu_json = json.dumps([{"id":m["id"],"name":m["name"],"price":m["price"],"duration":m["duration"],"emoji":m["emoji"]} for m in MENU_ITEMS], ensure_ascii=False)
+    html = DASHBOARD_HTML.replace("{{STORE_NAME}}", STORE_NAME).replace("{{BRAND_COLOR}}", BRAND_COLOR).replace("%MENU_JSON%", menu_json)
+    return html
 
 
 # --- 予約API ---
@@ -1480,6 +2023,150 @@ def api_cancel_reservation(rid):
         return jsonify({"success": True})
     except Exception as e:
         logger.error(f"APIキャンセルエラー: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# --- 電話予約登録API ---
+@app.route("/api/reservations/phone", methods=["POST"])
+@dashboard_auth_required
+def api_add_phone_reservation():
+    """ダッシュボードから電話予約を登録"""
+    body = request.get_json()
+    if not body:
+        return jsonify({"error": "リクエストボディが空です"}), 400
+
+    # バリデーション
+    date_str = body.get("reservation_date", "")
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        return jsonify({"error": "日付の形式が不正です（YYYY-MM-DD）"}), 400
+
+    time_str = body.get("reservation_time", "")
+    if not re.match(r"^\d{2}:\d{2}$", time_str):
+        return jsonify({"error": "時間の形式が不正です（HH:MM）"}), 400
+
+    valid, guest_count = validate_positive_int(body.get("guests", 0), max_val=MAX_SEATS)
+    if not valid:
+        return jsonify({"error": f"人数が不正です（1〜{MAX_SEATS}）"}), 400
+
+    valid_name, sanitized_name = validate_name(body.get("guest_name", ""))
+    if not valid_name:
+        return jsonify({"error": "お名前を入力してください（50文字以内）"}), 400
+
+    phone = body.get("phone", "")
+    if phone:
+        valid_phone, cleaned_phone = validate_phone(phone)
+        if not valid_phone:
+            return jsonify({"error": "電話番号の形式が不正です"}), 400
+        phone = cleaned_phone or phone
+
+    memo = sanitize_text(body.get("memo", ""), max_length=200)
+
+    # メニュー取得（任意。未指定なら「席のみ予約」）
+    menu_id = body.get("menu_id", "seat_only")
+    menu = next((m for m in MENU_ITEMS if m["id"] == menu_id), MENU_ITEMS[0])
+
+    # 滞在時間（任意。未指定ならメニューのデフォルト）
+    duration = int(body.get("duration_minutes", menu["duration"]))
+
+    # 定休日チェック
+    if db_is_closed_day(date_str):
+        return jsonify({"error": "指定日は定休日です"}), 400
+
+    # 空き席チェック
+    day_reservations = db_get_reservations_by_date(date_str)
+    slot_time = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+    reserved_seats = 0
+    for r in day_reservations:
+        r_start = datetime.datetime.strptime(
+            f"{r['reservation_date']} {r['reservation_time']}", "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=JST)
+        r_end = r_start + datetime.timedelta(minutes=r.get("duration_minutes", 60))
+        if r_start <= slot_time < r_end:
+            reserved_seats += r["guests"]
+    available = MAX_SEATS - reserved_seats
+    if available < guest_count:
+        return jsonify({"error": f"空席が足りません（残り{available}席）"}), 400
+
+    # 予約データ作成
+    reservation_data = {
+        "line_user_id": "phone_reservation",
+        "guest_name": sanitized_name,
+        "phone": phone,
+        "menu_id": menu["id"],
+        "menu_name": menu["name"],
+        "guests": guest_count,
+        "reservation_date": date_str,
+        "reservation_time": time_str,
+        "duration_minutes": duration,
+        "total_price": menu["price"] * guest_count,
+        "status": "confirmed",
+        "source": "phone",
+        "memo": memo,
+    }
+
+    # Googleカレンダーに登録
+    cal_event_id = create_calendar_event(reservation_data)
+    reservation_data["calendar_event_id"] = cal_event_id
+
+    # DBに保存
+    saved = db_save_reservation(reservation_data)
+    if not saved:
+        return jsonify({"error": "予約の保存に失敗しました"}), 500
+
+    # オーナーLINE通知
+    notify_owner(saved)
+
+    return jsonify({"success": True, "data": saved})
+
+
+# --- 予約編集API ---
+@app.route("/api/reservations/<int:rid>", methods=["PATCH"])
+@dashboard_auth_required
+def api_update_reservation(rid):
+    """ダッシュボードから予約情報を編集"""
+    body = request.get_json()
+    if not body:
+        return jsonify({"error": "リクエストボディが空です"}), 400
+
+    update_data = {}
+
+    if "guest_name" in body:
+        valid, name = validate_name(body["guest_name"])
+        if valid:
+            update_data["guest_name"] = name
+
+    if "phone" in body:
+        if body["phone"]:
+            valid, cleaned = validate_phone(body["phone"])
+            if valid:
+                update_data["phone"] = cleaned or body["phone"]
+        else:
+            update_data["phone"] = ""
+
+    if "guests" in body:
+        valid, count = validate_positive_int(body["guests"], max_val=MAX_SEATS)
+        if valid:
+            update_data["guests"] = count
+
+    if "memo" in body:
+        update_data["memo"] = sanitize_text(body.get("memo", ""), max_length=200)
+
+    if "reservation_date" in body:
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", body["reservation_date"]):
+            update_data["reservation_date"] = body["reservation_date"]
+
+    if "reservation_time" in body:
+        if re.match(r"^\d{2}:\d{2}$", body["reservation_time"]):
+            update_data["reservation_time"] = body["reservation_time"]
+
+    if not update_data:
+        return jsonify({"error": "更新する項目がありません"}), 400
+
+    try:
+        res = supabase_patch("reservations", update_data, {"id": f"eq.{rid}"})
+        return jsonify({"success": True, "data": res[0] if res else {}})
+    except Exception as e:
+        logger.error(f"予約更新エラー: {e}")
         return jsonify({"error": str(e)}), 500
 
 
