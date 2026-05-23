@@ -152,6 +152,8 @@ def supabase_post(table, data):
     """Supabase REST API POST (INSERT)"""
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     res = http_requests.post(url, headers=SUPABASE_HEADERS, json=data)
+    if not res.ok:
+        logger.error(f"Supabase POST エラー: {res.status_code} {res.text}")
     res.raise_for_status()
     return res.json()
 
@@ -274,6 +276,15 @@ def db_save_reservation(reservation_data):
         return res[0] if res else None
     except Exception as e:
         logger.error(f"予約保存エラー: {e}")
+        # source/memoカラム未追加の場合、それらを除外して再試行
+        if "source" in reservation_data or "memo" in reservation_data:
+            logger.info("source/memoカラム未対応の可能性 → カラム除外で再試行")
+            fallback_data = {k: v for k, v in reservation_data.items() if k not in ("source", "memo")}
+            try:
+                res = supabase_post("reservations", fallback_data)
+                return res[0] if res else None
+            except Exception as e2:
+                logger.error(f"予約保存エラー（再試行）: {e2}")
         return None
 
 
