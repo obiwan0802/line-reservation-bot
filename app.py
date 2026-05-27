@@ -371,6 +371,49 @@ def db_update_customer_visit(line_user_id, name=None, phone=None):
         logger.error(f"顧客更新エラー: {e}")
 
 
+def db_update_customer_visit_phone(guest_name, phone=None):
+    """電話予約の顧客を登録・更新（LINE IDがない顧客用）"""
+    try:
+        # 電話番号で既存顧客を検索（電話番号がある場合）
+        existing = None
+        if phone and phone not in ("なし", "未設定", ""):
+            rows = supabase_get("customers", {
+                "select": "*",
+                "phone": f"eq.{phone}",
+            })
+            if rows:
+                existing = rows[0]
+
+        # 電話番号で見つからなければ、名前+phone_reservationで検索
+        if not existing:
+            rows = supabase_get("customers", {
+                "select": "*",
+                "line_user_id": "eq.phone_reservation",
+                "display_name": f"eq.{guest_name}",
+            })
+            if rows:
+                existing = rows[0]
+
+        if existing:
+            update_data = {"visit_count": existing.get("visit_count", 0) + 1}
+            if guest_name:
+                update_data["display_name"] = guest_name
+            if phone and phone not in ("なし", "未設定", ""):
+                update_data["phone"] = phone
+            supabase_patch("customers", update_data, {"id": f"eq.{existing['id']}"})
+        else:
+            # 新規顧客作成
+            new_data = {
+                "line_user_id": "phone_reservation",
+                "display_name": guest_name,
+            }
+            if phone and phone not in ("なし", "未設定", ""):
+                new_data["phone"] = phone
+            supabase_post("customers", new_data)
+    except Exception as e:
+        logger.error(f"電話予約顧客更新エラー: {e}")
+
+
 def db_is_closed_day(date_str):
     """指定日が定休日・臨時休業かチェック"""
     try:
@@ -1184,6 +1227,11 @@ def handle_message(event):
             saved = db_save_reservation(reservation_data)
             session_delete(user_id)
             if saved:
+                # 顧客情報を登録・更新
+                db_update_customer_visit_phone(
+                    reservation_data["guest_name"],
+                    reservation_data.get("phone", "")
+                )
                 d = datetime.datetime.strptime(reservation_data["reservation_date"], "%Y-%m-%d")
                 wd = ["月","火","水","木","金","土","日"][d.weekday()]
                 memo_line = f"\n📝 {memo}" if memo else ""
@@ -2123,6 +2171,9 @@ def api_add_phone_reservation():
     saved = db_save_reservation(reservation_data)
     if not saved:
         return jsonify({"error": "予約の保存に失敗しました"}), 500
+
+    # 顧客情報を登録・更新
+    db_update_customer_visit_phone(sanitized_name, phone)
 
     # オーナーLINE通知
     notify_owner(saved)
